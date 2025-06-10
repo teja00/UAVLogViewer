@@ -7,9 +7,6 @@
             <a @click="share" class="section"><i class="fas fa-share-alt"></i> {{ shared ? 'Copied to clipboard!' :
                 'Share link'}}</a>
         </li>
-        <li v-if="url">
-            <a :href="'/uploaded/' + url" class="section" target="_blank"><i class="fas fa-download"></i> Download</a>
-        </li>
         <div @click="browse" @dragover.prevent @drop="onDrop" id="drop_zone"
         v-if="file==null && uploadpercentage===-1  && !sampleLoaded">
             <p>Drop *.tlog or *.bin file here or click to browse</p>
@@ -78,6 +75,14 @@ export default {
                 const urlParts = url.split('/')
                 this.state.file = urlParts[urlParts.length - 1]
             }
+
+            // Validate URL before making request
+            if (!url || typeof url !== 'string') {
+                console.error('Invalid URL provided for sample loading:', url)
+                alert('Invalid file URL provided')
+                return
+            }
+
             const oReq = new XMLHttpRequest()
             console.log(`loading file from ${url}`)
 
@@ -92,16 +97,25 @@ export default {
 
             // Use arrow function to preserve 'this' context
             oReq.onload = (oEvent) => {
-                const arrayBuffer = oReq.response
+                if (oReq.status >= 200 && oReq.status < 300) {
+                    const arrayBuffer = oReq.response
 
-                this.transferMessage = 'Download Done'
-                this.sampleLoaded = true
-                worker.postMessage({
-                    action: 'parse',
-                    file: arrayBuffer,
-                    isTlog: (url.indexOf('.tlog') > 0),
-                    isDji: (url.indexOf('.txt') > 0)
-                })
+                    this.transferMessage = 'Download Done'
+                    this.sampleLoaded = true
+                    worker.postMessage({
+                        action: 'parse',
+                        file: arrayBuffer,
+                        isTlog: (url.indexOf('.tlog') > 0),
+                        isDji: (url.indexOf('.txt') > 0)
+                    })
+                } else {
+                    console.error('Failed to load file:', oReq.status, oReq.statusText)
+                    const errorMsg = `Failed to load file: ${oReq.status} ${oReq.statusText}. ` +
+                        'Please check the file URL or try uploading a local file instead.'
+                    alert(errorMsg)
+                    this.uploadpercentage = -1
+                    this.transferMessage = ''
+                }
             }
             oReq.addEventListener('progress', (e) => {
                 if (e.lengthComputable) {
@@ -110,8 +124,12 @@ export default {
             }
             , false)
             oReq.onerror = (error) => {
-                alert('unable to fetch remote file, check CORS settings in the target server')
-                console.log(error)
+                console.error('Error loading file:', error)
+                const errorMsg = 'Unable to fetch remote file. ' +
+                    'Please check the file URL or try uploading a local file instead.'
+                alert(errorMsg)
+                this.uploadpercentage = -1
+                this.transferMessage = ''
             }
 
             oReq.send()
@@ -168,6 +186,12 @@ export default {
             reader.readAsArrayBuffer(file)
         },
         uploadFile () {
+            // This function is not needed for local file processing
+            // The app processes files locally without uploading to a server
+            console.warn('Upload functionality is disabled. Files are processed locally.')
+
+            // Old upload code commented out to prevent 401 errors
+            /*
             this.uploadStarted = true
             this.transferMessage = 'Upload Done!'
             this.uploadpercentage = 0
@@ -194,6 +218,7 @@ export default {
             , false)
             request.open('POST', '/upload')
             request.send(formData)
+            */
         },
         fixData (message) {
             if (message.name === 'GLOBAL_POSITION_INT') {
@@ -261,8 +286,21 @@ export default {
             }
         }
         const url = document.location.search.split('?file=')[1]
-        if (url) {
-            this.onLoadSample(decodeURIComponent(url))
+        if (url && url.trim() !== '') {
+            const decodedUrl = decodeURIComponent(url)
+            console.log('URL parameter found:', decodedUrl)
+            // Only load if it's a valid URL or sample file
+            const isValidUrl = decodedUrl === 'sample' ||
+                (decodedUrl.startsWith('http') &&
+                (decodedUrl.includes('.tlog') || decodedUrl.includes('.bin') || decodedUrl.includes('.txt')))
+            if (isValidUrl) {
+                console.log('Loading file from URL parameter:', decodedUrl)
+                this.onLoadSample(decodedUrl)
+            } else {
+                console.warn('Invalid or unsafe URL parameter ignored:', decodedUrl)
+            }
+        } else {
+            console.log('No file URL parameter found')
         }
     },
     components: {

@@ -170,16 +170,42 @@ export default {
                 }
             }
             try {
+                let startTime = null
+
+                // Try different GPS message sources
                 if (this.state.messages?.GPS?.time_boot_ms) {
-                    this.state.metadata = { startTime: this.dataExtractor.extractStartTime(this.state.messages.GPS) }
-                } else {
-                    this.state.metadata = {
-                        startTime: this.dataExtractor.extractStartTime(this.state.messages['GPS[0]'])
+                    startTime = this.dataExtractor.extractStartTime(this.state.messages.GPS)
+                } else if (this.state.messages?.['GPS[0]']?.time_boot_ms) {
+                    startTime = this.dataExtractor.extractStartTime(this.state.messages['GPS[0]'])
+                } else if (this.state.messages?.['GPS[1]']?.time_boot_ms) {
+                    startTime = this.dataExtractor.extractStartTime(this.state.messages['GPS[1]'])
+                }
+
+                // If no GPS time found, try to get the earliest time from any available message
+                if (!startTime && this.state.trajectories && Object.keys(this.state.trajectories).length > 0) {
+                    const firstTrajectory = Object.values(this.state.trajectories)[0]
+                    if (firstTrajectory?.trajectory?.length > 0) {
+                        // Use the first trajectory point's time (converted from ms to Date)
+                        const firstPoint = firstTrajectory.trajectory[0]
+                        if (firstPoint && firstPoint[3]) {
+                            startTime = new Date(firstPoint[3])
+                        }
                     }
                 }
+
+                // Final fallback to current time if all else fails
+                if (!startTime) {
+                    console.warn('No valid start time found, using current time as fallback')
+                    startTime = new Date()
+                }
+
+                this.state.metadata = { startTime: startTime }
+                console.log('Metadata startTime set to:', startTime)
             } catch (error) {
-                console.log('unable to load metadata')
+                console.log('unable to load metadata, using fallback')
                 console.log(error)
+                // Fallback to current time
+                this.state.metadata = { startTime: new Date() }
             }
             try {
                 this.state.namedFloats = this.dataExtractor.extractNamedValueFloatNames(this.state.messages)

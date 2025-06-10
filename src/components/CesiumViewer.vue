@@ -60,7 +60,8 @@ import {
     PolylineColorAppearance,
     Primitive,
     ShaderSource,
-    ImageMaterialProperty
+    ImageMaterialProperty,
+    createWorldImageryAsync
 } from 'cesium'
 
 import { DateTime } from 'luxon'
@@ -85,7 +86,15 @@ import {
 } from './cesiumExtra/boundingPolygon.js'
 
 // Set Cesium token from environment variable
-Ion.defaultAccessToken = process.env.VUE_APP_CESIUM_TOKEN || ''
+const cesiumToken = process.env.VUE_APP_CESIUM_TOKEN || ''
+// console.log('Environment variable VUE_APP_CESIUM_TOKEN:', process.env.VUE_APP_CESIUM_TOKEN)
+// if (cesiumToken) {
+//     console.log('Cesium token configured: Token present (length:', cesiumToken.length, ')')
+//     console.log('Cesium token starts with:', cesiumToken.substring(0, 20) + '...')
+// } else {
+//     console.log('Cesium token configured: No token found')
+// }
+Ion.defaultAccessToken = cesiumToken
 
 const colorCoderMode = new ColorCoderMode(store)
 const colorCoderRange = new ColorCoderRange(store)
@@ -261,9 +270,8 @@ export default {
                         scene3DOnly: false,
                         selectionIndicator: false,
                         shadows: true,
-                        // eslint-disable-next-line
-                        baseLayer: new ImageryLayer.fromProviderAsync(
-                            IonImageryProvider.fromAssetId(3954)
+                        baseLayer: ImageryLayer.fromProviderAsync(
+                            createWorldImageryAsync()
                         ),
                         imageryProviderViewModels: imageryProviders,
                         orderIndependentTranslucency: false,
@@ -333,6 +341,7 @@ export default {
                 }
             })
             imageryProviders.push(this.sentinelProvider)
+            /* Temporarily disabled Eniro provider to prevent 401 errors
             imageryProviders.push(new ProviderViewModel({
                 name: 'Eniro',
                 iconUrl: require('../assets/eniro.png').default,
@@ -345,6 +354,7 @@ export default {
                     })
                 }
             }))
+            */
             imageryProviders.push(new ProviderViewModel({
                 name: 'OpenSeaMap',
                 iconUrl: require('../assets/openseamap.png').default,
@@ -604,9 +614,25 @@ export default {
         getTimeStart () {
             let date = null
             try {
-                date = JulianDate.fromDate(this.state.metadata.startTime)
+                // Check if startTime exists and is valid
+                if (this.state.metadata && this.state.metadata.startTime) {
+                    // Ensure we have a valid Date object
+                    const startTime = this.state.metadata.startTime instanceof Date
+                        ? this.state.metadata.startTime
+                        : new Date(this.state.metadata.startTime)
+
+                    // Check if the date is valid
+                    if (!isNaN(startTime.getTime())) {
+                        date = JulianDate.fromDate(startTime)
+                    } else {
+                        throw new Error('Invalid startTime date')
+                    }
+                } else {
+                    throw new Error('No startTime available')
+                }
             } catch (e) {
-                console.log(e)
+                console.log('Date validation error:', e)
+                // Use a default date from 2015 (matching the log file timestamp)
                 date = JulianDate.fromDate(new Date(2015, 2, 25, 16))
             }
             return date

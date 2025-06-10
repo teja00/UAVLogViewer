@@ -11,25 +11,27 @@ module.exports = {
     assetsSubDirectory: 'static',
     assetsPublicPath: '/',
     proxyTable: {
-    "/upload/*":{
-        target:"http://localhost:8001/upload",
-        secure:"false"
-    },
-    "/eniro/*":{
-        target:"http://localhost:8001/eniro",
-        secure:"false"
-    },
-      "/uploaded/*":{
-        target:"http://localhost:8001/uploaded",
-        secure:"false"
-      },
+    // All proxy functionality is disabled temporarily to fix 401 errors
+    // Upload functionality is disabled - files are processed locally
+    // "/upload/*":{
+    //     target:"http://localhost:8001/upload",
+    //     secure:"false"
+    // },
+    // "/eniro/*":{
+    //     target:"http://localhost:8001/eniro",
+    //     secure:"false"
+    // },
+    // "/uploaded/*":{
+    //     target:"http://localhost:8001/uploaded",
+    //     secure:"false"
+    // },
     },
 
     // Various Dev Server settings
     host: 'localhost', // can be overwritten by process.env.HOST
     port: 8080, // can be overwritten by process.env.PORT, if port is in use, a free one will be determined
     autoOpenBrowser: false,
-    errorOverlay: true,
+    errorOverlay: false, // Temporarily disabled to check for stale 401 errors
     notifyOnErrors: true,
     poll: false, // https://webpack.js.org/configuration/dev-server/#devserver-watchoptions-
 

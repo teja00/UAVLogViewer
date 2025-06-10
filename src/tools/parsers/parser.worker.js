@@ -25,6 +25,7 @@ self.addEventListener('message', async function (event) {
     } else if (event.data.action === 'loadType') {
         if (!parser) {
             console.log('parser not ready')
+            return
         }
         parser.loadType(event.data.type.split('[')[0])
     } else if (event.data.action === 'trimFile') {
