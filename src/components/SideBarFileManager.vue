@@ -49,7 +49,8 @@ export default {
             transferMessage: '',
             state: store,
             file: null,
-            uploadStarted: false
+            uploadStarted: false,
+            backendUrl: 'http://localhost:8000'
         }
     },
     created () {
@@ -164,6 +165,33 @@ export default {
                 type: type
             })
         },
+        async uploadLogForV2 (file) {
+            const formData = new FormData()
+            formData.append('file', file)
+
+            try {
+                this.state.v2Processing = true
+
+                const response = await fetch(`${this.backendUrl}/v2/sessions/upload-log`, {
+                    method: 'POST',
+                    body: formData
+                })
+
+                if (!response.ok) {
+                    const errorData = await response.json()
+                    throw new Error(errorData.detail || `HTTP error! status: ${response.status}`)
+                }
+
+                const { session_id: sessionId } = await response.json()
+                this.state.v2SessionId = sessionId
+                console.log(`Started V2 processing with session ID: ${sessionId}`)
+                this.$eventHub.$emit('v2-session-created', sessionId)
+            } catch (error) {
+                console.error('Error uploading log file for V2 analysis:', error)
+                this.state.v2Processing = false
+                this.$eventHub.$emit('v2-session-error', error.message)
+            }
+        },
         process: function (file) {
             this.state.file = file.name
             this.state.processStatus = 'Pre-processing...'
@@ -184,6 +212,9 @@ export default {
                 this.state.logType = 'dji'
             }
             reader.readAsArrayBuffer(file)
+
+            // Upload the file to the V2 backend for processing
+            this.uploadLogForV2(file)
         },
         uploadFile () {
             // This function is not needed for local file processing

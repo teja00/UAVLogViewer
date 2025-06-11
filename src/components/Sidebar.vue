@@ -10,7 +10,16 @@
         <!-- TABHOLDER -->
         <i class="fa fa-bars fa-2x toggle-btn" v-b-toggle.menucontent></i>
         <b-collapse class="menu-content collapse out" id="menucontent" visible>
-            <span v-if="state.file" class="filename">Current file: {{state.file}}</span>
+            <span v-if="state.file" class="filename">
+                Current file: {{state.file}}
+                <span v-if="state.v2Processing" class="processing-status">
+                    <span class="processing-spinner"></span>
+                    Processing...
+                </span>
+                <span v-else-if="state.v2SessionId && !state.v2Processing" class="ready-status">
+                    ✅ Ready for analysis
+                </span>
+            </span>
             <div class="tabholder">
                 <!-- Home -->
                 <a :class="selected === 'home' ? 'selected' : ''" @click="selected='home'" v-if="!state.processDone">
@@ -565,6 +574,36 @@ a.centered-section {
         text-align: center;
         opacity: 0.8;
         margin: 6px;
+    }
+
+    .processing-status {
+        display: block;
+        color: #f39c12;
+        font-size: 12px;
+        margin-top: 4px;
+    }
+
+    .ready-status {
+        display: block;
+        color: #27ae60;
+        font-size: 12px;
+        margin-top: 4px;
+    }
+
+    .processing-spinner {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border: 1px solid transparent;
+        border-top: 1px solid #f39c12;
+        border-radius: 50%;
+        animation: sidebar-spin 1s linear infinite;
+        margin-right: 4px;
+    }
+
+    @keyframes sidebar-spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
     }
 
     .download-text {

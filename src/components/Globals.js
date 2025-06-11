@@ -38,6 +38,8 @@ export const store = {
     textMessages: [],
     namedFloats: [],
     metadata: null,
+    v2SessionId: null,
+    v2Processing: false,
     // cesium menu:
     modelScale: 1.0,
     heightOffset: 0.0,

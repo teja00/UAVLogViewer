@@ -40,6 +40,7 @@ class TelemetryMessage(BaseModel):
 
 class TelemetryMetadata(BaseModel):
     """Metadata about the telemetry data"""
+    filename: Optional[str] = Field(None, description="Name of the uploaded log file")
     startTime: Optional[int] = Field(None, description="Start time in milliseconds since epoch")
     vehicleType: Optional[str] = Field(None, description="Type of vehicle")
     logType: Optional[str] = Field(None, description="Log file type (bin, tlog, txt)")
@@ -89,4 +90,18 @@ class ErrorResponse(BaseModel):
     """Error response"""
     error: str = Field(..., description="Error message")
     details: Optional[str] = Field(None, description="Additional error details")
-    timestamp: datetime = Field(default_factory=datetime.now, description="Error timestamp") 
+    timestamp: datetime = Field(default_factory=datetime.now, description="Error timestamp")
+
+
+class V2ConversationSession(ConversationSession):
+    """
+    Extends the base ConversationSession to hold state specific to the
+    agentic V2 service, such as pandas DataFrames.
+    """
+    dataframes: Dict[str, Any] = Field(default_factory=dict, description="Pandas DataFrames for analysis")
+    dataframe_schemas: Dict[str, Any] = Field(default_factory=dict, description="Schemas of the DataFrames")
+    is_processing: bool = Field(False, description="Flag to indicate if a log file is currently being processed")
+    processing_error: Optional[str] = Field(None, description="Stores any error message from the processing stage")
+
+    class Config:
+        arbitrary_types_allowed = True 

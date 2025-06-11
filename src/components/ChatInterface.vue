@@ -22,6 +22,13 @@
       <div class="chat-section">
         <div class="file-info">
           <span class="file-name">📄 {{ uploadedFileName }}</span>
+          <span v-if="state.v2Processing" class="processing-indicator">
+            <span class="spinner"></span>
+            Processing...
+          </span>
+          <span v-else-if="isReadyForChat" class="ready-indicator">
+            ✅ Ready
+          </span>
         </div>
 
         <!-- Messages -->
@@ -47,16 +54,18 @@
             v-model="currentMessage"
             @keyup.enter="sendMessage"
             @keydown.enter.prevent
-            placeholder="Ask about your flight data..."
-            :disabled="isTyping"
+            :placeholder="isProcessing ? 'Processing your log file...' : 'Ask about your flight data...'"
+            :disabled="isTyping || !isReadyForChat || isProcessing"
             class="message-input"
+            :class="{ 'processing': isProcessing }"
           >
           <button
             @click="sendMessage"
-            :disabled="!currentMessage.trim() || isTyping"
+            :disabled="!currentMessage.trim() || isTyping || !isReadyForChat || isProcessing"
             class="send-btn"
+            :class="{ 'processing': isProcessing }"
           >
-            Send
+Send
           </button>
         </div>
       </div>
@@ -76,11 +85,11 @@ export default {
             currentMessage: '',
             messages: [],
             isTyping: false,
-            sessionId: null,
             backendUrl: 'http://localhost:8000', // Backend URL
             state: store,
-            initializedFile: null,
-            isInitializing: false
+            isReadyForChat: false,
+            isProcessing: false,
+            processingPollInterval: null
         }
     },
     computed: {
@@ -91,56 +100,54 @@ export default {
             return this.state.file
         }
     },
+    created () {
+        this.$eventHub.$on('v2-session-created', (sessionId) => {
+            console.log(`ChatInterface received v2-session-created event with session ID: ${sessionId}`)
+            this.isProcessing = true
+            this.isReadyForChat = false
+            this.messages = [] // Clear any previous messages
+            this.addMessage('bot', 'Your flight log is being processed. Please wait while we analyze your data...')
+            this.startProcessingPolling()
+        })
+
+        this.$eventHub.$on('v2-session-error', (errorMessage) => {
+            this.isProcessing = false
+            this.isReadyForChat = false
+            this.state.v2Processing = false
+            this.messages = []
+            this.addMessage('bot', `An error occurred: ${errorMessage}`)
+            this.stopProcessingPolling()
+        })
+
+        // Handle file changes to reset the chat state
+        this.$watch('state.file', (newFile, oldFile) => {
+            if (newFile !== oldFile) {
+                this.isOpen = false
+                this.isReadyForChat = false
+                this.isProcessing = false
+                this.state.v2Processing = false
+                this.messages = []
+                this.stopProcessingPolling()
+            }
+        })
+    },
+    beforeDestroy () {
+        this.stopProcessingPolling()
+    },
     methods: {
-        async toggleChat () {
+        toggleChat () {
             if (!this.hasUploadedFile) {
                 this.isOpen = false
                 return
             }
-
             this.isOpen = !this.isOpen
-
-            if (this.isOpen && this.uploadedFileName !== this.initializedFile) {
-                await this.initializeChat()
-            }
-        },
-
-        async initializeChat () {
-            if (this.isInitializing) return
-            this.isInitializing = true
-
-            try {
-                this.messages = [] // Clear previous messages
-                this.addMessage('bot', 'Analyzing your flight data, please wait...')
-
-                const telemetryData = {
-                    messages: this.state.messages || {},
-                    metadata: {
-                        filename: this.uploadedFileName,
-                        ...this.state.metadata
-                    }
-                }
-
-                const response = await axios.post(`${this.backendUrl}/chat`, {
-                    message: 'File uploaded - ready for analysis',
-                    telemetryData,
-                    sessionId: null // Start a new session
-                })
-
-                this.sessionId = response.data.sessionId
-                this.initializedFile = this.uploadedFileName
-                this.messages = [] // Clear "Analyzing" message
-                this.addMessage('bot', 'File analysis complete! I am ready to answer your questions.')
-            } catch (error) {
-                console.error('Chat initialization error:', error)
-                this.addMessage('bot', 'Error initializing chat: ' + (error.response?.data?.error || error.message) + '. Please try again.')
-            } finally {
-                this.isInitializing = false
+            if (this.isOpen && !this.isReadyForChat && this.hasUploadedFile) {
+                this.messages = [{ type: 'bot', content: 'Connecting to chat service...' }]
             }
         },
 
         async sendMessage () {
-            if (!this.currentMessage.trim() || this.isTyping || this.isInitializing) return
+            if (!this.currentMessage.trim() || this.isTyping || !this.isReadyForChat || this.isProcessing) return
 
             const userMessage = this.currentMessage.trim()
             this.addMessage('user', userMessage)
@@ -148,9 +155,14 @@ export default {
             this.isTyping = true
 
             try {
-                const response = await axios.post(`${this.backendUrl}/chat`, {
+                if (!this.state.v2SessionId) {
+                    throw new Error('V2 Session ID is not available.')
+                }
+
+                const response = await axios.post(`${this.backendUrl}/v2/chat`, {
                     message: userMessage,
-                    sessionId: this.sessionId
+                    // eslint-disable-next-line camelcase
+                    session_id: this.state.v2SessionId
                 })
 
                 if (response.data.response) {
@@ -162,6 +174,63 @@ export default {
             } finally {
                 this.isTyping = false
                 this.scrollToBottom()
+            }
+        },
+
+        async startProcessingPolling () {
+            if (this.processingPollInterval) {
+                clearInterval(this.processingPollInterval)
+            }
+
+            this.processingPollInterval = setInterval(async () => {
+                await this.checkProcessingStatus()
+            }, 2000) // Poll every 2 seconds
+
+            // Also check immediately
+            await this.checkProcessingStatus()
+        },
+
+        stopProcessingPolling () {
+            if (this.processingPollInterval) {
+                clearInterval(this.processingPollInterval)
+                this.processingPollInterval = null
+            }
+        },
+
+        async checkProcessingStatus () {
+            if (!this.state.v2SessionId) return
+
+            try {
+                const response = await axios.get(`${this.backendUrl}/v2/sessions/${this.state.v2SessionId}`)
+                const sessionInfo = response.data
+
+                console.log('Session status:', sessionInfo)
+
+                if (!sessionInfo.is_processing && sessionInfo.has_dataframes) {
+                    // Processing is complete and data is available
+                    this.isProcessing = false
+                    this.isReadyForChat = true
+                    this.state.v2Processing = false
+                    this.stopProcessingPolling()
+
+                    // Update the bot message
+                    if (this.messages.length > 0 && this.messages[0].type === 'bot') {
+                        this.messages[0].content = 'Your flight log has been processed successfully and you can now ask questions about your flight data.'
+                    } else {
+                        this.addMessage('bot', 'Your flight log has been processed successfully and you can now ask questions about your flight data.')
+                    }
+                } else if (!sessionInfo.is_processing && sessionInfo.processing_error) {
+                    // Processing failed
+                    this.isProcessing = false
+                    this.isReadyForChat = false
+                    this.state.v2Processing = false
+                    this.stopProcessingPolling()
+                    this.addMessage('bot', `Processing failed: ${sessionInfo.processing_error}`)
+                }
+                // If still processing, continue polling
+            } catch (error) {
+                console.error('Error checking processing status:', error)
+                // Don't stop polling on network errors, just log them
             }
         },
 
@@ -177,16 +246,6 @@ export default {
                     container.scrollTop = container.scrollHeight
                 }
             })
-        }
-    },
-    watch: {
-        'state.file' (newFile, oldFile) {
-            if (newFile !== oldFile) {
-                this.isOpen = false
-                this.initializedFile = null
-                this.messages = []
-                this.sessionId = null
-            }
         }
     }
 }
@@ -309,7 +368,36 @@ export default {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 250px;
+    max-width: 200px;
+}
+
+.processing-indicator {
+  display: flex;
+  align-items: center;
+  color: #f39c12;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.ready-indicator {
+  color: #27ae60;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #34495e;
+  border-top: 2px solid #f39c12;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  margin-right: 5px;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
 }
 
 .messages-container {
@@ -333,77 +421,106 @@ export default {
 }
 
 .message-content {
-  background: #34495e;
+  max-width: 80%;
   padding: 10px 15px;
   border-radius: 15px;
-  max-width: 80%;
+  word-wrap: break-word;
 }
 
 .message.user .message-content {
-  background: #2980b9;
+  background-color: #3498db;
   color: white;
 }
 
-.message.bot .message-content.typing {
-  display: flex;
-  align-items: center;
-}
-
-.message.bot .message-content.typing span {
-  height: 8px;
-  width: 8px;
-  background: #bdc3c7;
-  border-radius: 50%;
-  margin: 0 2px;
-  animation: typing-blink 1.4s infinite both;
-}
-
-.message.bot .message-content.typing span:nth-child(2) {
-  animation-delay: 0.2s;
-}
-
-.message.bot .message-content.typing span:nth-child(3) {
-  animation-delay: 0.4s;
-}
-
-@keyframes typing-blink {
-  0% { opacity: 0.2; }
-  20% { opacity: 1; }
-  100% { opacity: 0.2; }
+.message.bot .message-content {
+  background-color: #34495e;
+  color: #ecf0f1;
 }
 
 .input-area {
   padding: 15px;
-  display: flex;
   border-top: 1px solid #34495e;
+  display: flex;
+  gap: 10px;
 }
 
 .message-input {
   flex-grow: 1;
-  padding: 10px;
+  padding: 10px 15px;
   border: 1px solid #34495e;
   border-radius: 20px;
-  background: #ecf0f1;
-  color: #2c3e50;
+  background-color: #2c3e50;
+  color: #ecf0f1;
+  outline: none;
 }
 
 .message-input:focus {
-  outline: none;
   border-color: #3498db;
 }
 
+.message-input.processing {
+  background-color: #2c3e50;
+  border-color: #95a5a6;
+  color: #95a5a6;
+  cursor: not-allowed;
+}
+
 .send-btn {
-  margin-left: 10px;
   padding: 10px 20px;
-  border: none;
-  background: #2980b9;
+  background-color: #3498db;
   color: white;
+  border: none;
   border-radius: 20px;
   cursor: pointer;
+  font-weight: bold;
+}
+
+.send-btn:hover:not(:disabled) {
+  background-color: #2980b9;
 }
 
 .send-btn:disabled {
-  background: #95a5a6;
+  background-color: #7f8c8d;
   cursor: not-allowed;
 }
+
+.send-btn.processing {
+  background-color: #95a5a6;
+  cursor: not-allowed;
+}
+
+/* Typing indicator */
+.typing {
+  display: flex;
+  align-items: center;
+  padding: 10px 15px;
+}
+
+.typing span {
+  height: 8px;
+  width: 8px;
+  border-radius: 50%;
+  background-color: #95a5a6;
+  display: inline-block;
+  margin-right: 5px;
+  animation: typing 1.4s infinite;
+}
+
+.typing span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.typing span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes typing {
+  0%, 60%, 100% {
+    transform: translateY(0);
+  }
+  30% {
+    transform: translateY(-10px);
+  }
+}
+
 </style>
