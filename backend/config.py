@@ -27,6 +27,10 @@ class Settings:
         "CORS_ORIGINS", 
         "http://localhost:8080,http://localhost:3000,http://127.0.0.1:8080,http://localhost:8001"
     ).split(",")
+    
+    # Performance Configuration
+    use_optimized_parser: bool = os.getenv("USE_OPTIMIZED_PARSER", "true").lower() == "true"
+    parser_max_workers: int = int(os.getenv("PARSER_MAX_WORKERS", "0"))  # 0 means auto-detect
 
 def get_settings() -> Settings:
     """Get application settings instance"""

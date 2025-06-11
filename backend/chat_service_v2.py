@@ -32,6 +32,7 @@ from models import (
     TelemetryData,
     V2ConversationSession,
 )
+from optimized_parser import parse_bin_file_optimized
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -311,67 +312,160 @@ DATAFRAMES:
 
     async def process_log_file(self, session_id: str, file_path: str):
         """
-        Parses a log file (e.g., .bin) directly into pandas DataFrames
-        and stores them in the session. This is designed to be run as a
-        background task.
+        Parses a log file (e.g., .bin) directly into pandas DataFrames using optimized parsing
+        and stores them in the session. This is designed to be run as a background task.
+        
+        Uses high-performance parsing with multiple optimization strategies:
+        - Memory-mapped parsing for smaller files
+        - Parallel chunked parsing for larger files  
+        - Optimized data types and batching
         """
         session = await self.create_or_get_session(session_id)
-        logger.info(f"[{session_id}] Starting log file processing for {file_path}")
+        start_time = time.time()
+        
+        # Check if optimized parsing is enabled
+        use_optimized = self.settings.use_optimized_parser
+        logger.info(f"[{session_id}] Starting {'optimized' if use_optimized else 'standard'} log file processing for {file_path}")
 
         try:
             session.dataframes = {}
             session.dataframe_schemas = {}
             session.processing_error = None
 
-            logger.info(f"[{session_id}] Opening log file with DFReader: {file_path}")
-            log = DFReader.DFReader_binary(file_path)
+            if use_optimized:
+                try:
+                    # Use the optimized parser
+                    logger.info(f"[{session_id}] Using optimized bin file parser")
+                    dataframes, schemas = await parse_bin_file_optimized(file_path, session_id)
+                    
+                    # Store the results
+                    session.dataframes = dataframes
+                    session.dataframe_schemas = schemas
+                    
+                    processing_time = time.time() - start_time
+                    total_messages = sum(len(df) for df in dataframes.values())
+                    
+                    logger.info(f"[{session_id}] OPTIMIZED PARSING COMPLETE!")
+                    logger.info(f"[{session_id}] Processing time: {processing_time:.2f}s")
+                    logger.info(f"[{session_id}] Total messages: {total_messages:,}")
+                    logger.info(f"[{session_id}] Message types: {len(dataframes)}")
+                    logger.info(f"[{session_id}] Throughput: {total_messages/processing_time:.0f} messages/second")
+                    logger.info(f"[{session_id}] DataFrames created for: {list(dataframes.keys())}")
+                    
+                except Exception as e:
+                    logger.warning(f"[{session_id}] Optimized parsing failed: {e}, falling back to standard parsing")
+                    # Fall through to standard parsing
+                    use_optimized = False
             
-            data = {}
-            message_count = 0
-            while True:
-                msg = log.recv_msg()
-                if msg is None:
-                    break
-                msg_type = msg.get_type()
-                if msg_type not in data:
-                    data[msg_type] = []
-                data[msg_type].append(msg.to_dict())
-                message_count += 1
+            if not use_optimized:
+                # Use standard parsing method
+                await self._standard_parse_log_file(session_id, file_path, session)
                 
-                # Log progress every 1000 messages
-                if message_count % 1000 == 0:
-                    logger.info(f"[{session_id}] Processed {message_count} messages...")
-
-            logger.info(f"[{session_id}] Finished reading {message_count} messages, found {len(data)} message types: {list(data.keys())}")
-
-            for msg_type, msg_list in data.items():
-                if not msg_list:
-                    continue
+                processing_time = time.time() - start_time
+                total_messages = sum(len(df) for df in session.dataframes.values())
                 
-                logger.info(f"[{session_id}] Creating DataFrame for {msg_type} with {len(msg_list)} messages")
-                df = pd.DataFrame(msg_list)
-                
-                if 'TimeUS' in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['TimeUS'], unit='us')
-                elif 'time_boot_ms' in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['time_boot_ms'], unit='ms')
-
-                session.dataframes[msg_type] = df
-                
-                session.dataframe_schemas[msg_type] = {
-                    "columns": {col: str(dtype) for col, dtype in df.dtypes.items()},
-                    "description": f"Contains {msg_type} data from the flight log."
-                }
-            
-            logger.info(f"[{session_id}] Successfully processed and created DataFrames for {len(session.dataframes)} message types: {list(session.dataframes.keys())}")
+                logger.info(f"[{session_id}] Standard parsing completed in {processing_time:.2f}s")
+                logger.info(f"[{session_id}] Total messages: {total_messages:,}, Message types: {len(session.dataframes)}")
 
         except Exception as e:
             session.processing_error = str(e)
-            logger.error(f"[{session_id}] Error processing log file {file_path}: {e}", exc_info=True)
+            logger.error(f"[{session_id}] Error in log file processing {file_path}: {e}", exc_info=True)
             
         finally:
             session.is_processing = False
             session.last_updated = datetime.now()
+
+    async def _standard_parse_log_file(self, session_id: str, file_path: str, session: V2ConversationSession):
+        """
+        Standard parsing method using the original DFReader approach.
+        """
+        logger.info(f"[{session_id}] Using standard DFReader parsing method")
+        
+        log = DFReader.DFReader_binary(file_path)
+        
+        data = {}
+        message_count = 0
+        while True:
+            msg = log.recv_msg()
+            if msg is None:
+                break
+            msg_type = msg.get_type()
+            if msg_type not in data:
+                data[msg_type] = []
+            data[msg_type].append(msg.to_dict())
+            message_count += 1
+            
+            # Log progress every 2000 messages for less noise
+            if message_count % 2000 == 0:
+                logger.info(f"[{session_id}] Standard parsing: processed {message_count} messages...")
+
+        logger.info(f"[{session_id}] Standard parsing finished reading {message_count} messages, found {len(data)} message types")
+
+        for msg_type, msg_list in data.items():
+            if not msg_list:
+                continue
+            
+            df = pd.DataFrame(msg_list)
+            
+            if 'TimeUS' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['TimeUS'], unit='us')
+            elif 'time_boot_ms' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['time_boot_ms'], unit='ms')
+
+            session.dataframes[msg_type] = df
+            
+            session.dataframe_schemas[msg_type] = {
+                "columns": {col: str(dtype) for col, dtype in df.dtypes.items()},
+                "description": f"Contains {msg_type} data from the flight log."
+            }
+        
+        logger.info(f"[{session_id}] Standard parsing completed successfully")
+
+    async def _fallback_parse_log_file(self, session_id: str, file_path: str, session: V2ConversationSession):
+        """
+        Fallback to the original parsing method if optimized parsing fails.
+        """
+        logger.info(f"[{session_id}] Starting fallback parsing with original DFReader method")
+        
+        log = DFReader.DFReader_binary(file_path)
+        
+        data = {}
+        message_count = 0
+        while True:
+            msg = log.recv_msg()
+            if msg is None:
+                break
+            msg_type = msg.get_type()
+            if msg_type not in data:
+                data[msg_type] = []
+            data[msg_type].append(msg.to_dict())
+            message_count += 1
+            
+            # Log progress every 2000 messages for less noise
+            if message_count % 2000 == 0:
+                logger.info(f"[{session_id}] Fallback processed {message_count} messages...")
+
+        logger.info(f"[{session_id}] Fallback finished reading {message_count} messages, found {len(data)} message types")
+
+        for msg_type, msg_list in data.items():
+            if not msg_list:
+                continue
+            
+            df = pd.DataFrame(msg_list)
+            
+            if 'TimeUS' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['TimeUS'], unit='us')
+            elif 'time_boot_ms' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['time_boot_ms'], unit='ms')
+
+            session.dataframes[msg_type] = df
+            
+            session.dataframe_schemas[msg_type] = {
+                "columns": {col: str(dtype) for col, dtype in df.dtypes.items()},
+                "description": f"Contains {msg_type} data from the flight log."
+            }
+        
+        logger.info(f"[{session_id}] Fallback parsing completed successfully")
 
     async def chat(self, session_id: str, user_message: str) -> str:
         """

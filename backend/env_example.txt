@@ -6,3 +6,7 @@ HOST=0.0.0.0
 PORT=8000
 RELOAD=true
 LOG_LEVEL=info 
+
+# Performance Configuration - Optimized Bin File Parsing
+USE_OPTIMIZED_PARSER=true
+PARSER_MAX_WORKERS=0 
