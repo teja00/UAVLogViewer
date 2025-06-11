@@ -9,4 +9,7 @@ aiofiles==23.2.1
 numpy==1.24.3
 pandas==2.0.3
 requests==2.31.0
-httpx==0.25.2 
+httpx==0.25.2
+beautifulsoup4==4.12.2
+lxml==4.9.3
+pymavlink==2.4.37 

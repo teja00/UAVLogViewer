@@ -7,6 +7,7 @@
       :class="{ 'active': isOpen }"
       :disabled="!hasUploadedFile"
       title="Open UAV Chat"
+      v-show="!isOpen"
     >
       💬 UAV Chat
     </button>
@@ -142,7 +143,7 @@ export default {
             }
             this.isOpen = !this.isOpen
             if (this.isOpen && !this.isReadyForChat && this.hasUploadedFile) {
-                this.messages = [{ type: 'bot', content: 'Connecting to chat service...' }]
+                this.messages = [{ type: 'bot', content: 'Data is loading in the backend...' }]
             }
         },
 
