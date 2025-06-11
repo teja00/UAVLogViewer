@@ -22,13 +22,7 @@ module.exports = {
   // add your custom rules here
   rules: {
     // allow async-await
-   "max-len": ["error", 120, 2, {
-      ignoreUrls: true,
-          ignoreComments: false,
-          ignoreRegExpLiterals: true,
-          ignoreStrings: false,
-          ignoreTemplateLiterals: false,
-        }],
+   "max-len": "off",
     'generator-star-spacing': 'off',
     // allow debugger during development
     'no-debugger': process.env.NODE_ENV === 'production' ? 'error' : 'off',

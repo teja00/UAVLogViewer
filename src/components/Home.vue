@@ -38,6 +38,9 @@
             </main>
 
         </div>
+
+        <!-- Chat Interface -->
+        <ChatInterface />
     </div>
 </template>
 
@@ -60,6 +63,7 @@ import { MavlinkDataExtractor } from '../tools/mavlinkDataExtractor'
 import { DjiDataExtractor } from '../tools/djiDataExtractor'
 import MagFitTool from '@/components/widgets/MagFitTool.vue'
 import EkfHelperTool from '@/components/widgets/EkfHelperTool.vue'
+import ChatInterface from '@/components/ChatInterface.vue'
 import Vue from 'vue'
 
 export default {
@@ -265,7 +269,8 @@ export default {
         DeviceIDViewer,
         AttitudeViewer,
         MagFitTool,
-        EkfHelperTool
+        EkfHelperTool,
+        ChatInterface
     },
     computed: {
         mapOk () {

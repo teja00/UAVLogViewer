@@ -1,319 +1,319 @@
-# UAV Log Viewer Chatbot Backend
+# UAV Log Analyzer - AI Chat Backend
 
-A FastAPI-based backend service that provides intelligent chatbot functionality for analyzing UAV telemetry logs. This backend integrates with OpenAI's GPT models to provide natural language querying of MAVLink flight data.
+An OpenAI-powered chatbot backend for analyzing UAV flight telemetry data. This backend receives pre-parsed telemetry data from the frontend and provides intelligent analysis using GPT models with comprehensive ArduPilot knowledge.
 
-## Features
+## Architecture
 
-### 🚁 Telemetry Analysis
-- Parses UAV flight logs (.bin, .tlog files)
-- Extracts flight data including GPS tracks, attitude, battery status, and flight modes
-- Provides statistical analysis of flight performance
+The backend is designed to work with the existing Vue.js frontend that already handles:
+- Binary log file parsing (.bin, .tlog, .txt files)
+- Data extraction using JavaScript workers
+- Real-time telemetry visualization
 
-### 🤖 Intelligent Chatbot
-- Natural language querying of flight data
-- Context-aware conversations using OpenAI GPT models
-- Maintains conversation history and session state
-- Proactive clarification when needed
+The backend focuses solely on:
+- Receiving parsed telemetry data from frontend
+- Providing AI-powered analysis using OpenAI GPT
+- Maintaining conversation context and history
+- Leveraging ArduPilot documentation knowledge
 
-### 📊 Data Insights
-- Flight statistics (duration, altitude, speed, etc.)
-- Battery performance analysis
-- GPS trajectory and position data
-- Event detection and timeline analysis
+## Key Features
 
-## Installation
+- **Frontend Integration**: Designed to work with existing Vue.js app's parsing logic
+- **ArduPilot Knowledge**: Built-in understanding of 25+ ArduPilot message types
+- **Conversation Management**: Maintains context across multiple questions
+- **Intelligent Analysis**: Provides insights on flight performance, safety, and optimization
+- **Session Management**: Tracks conversation history and telemetry data
+- **Real-time Response**: Fast API responses for interactive chat experience
 
-### Prerequisites
-- Python 3.8+
-- OpenAI API key
+## Quick Start
 
-### Setup
+### 1. Environment Setup
 
-1. **Clone the repository** (if not already done):
-   ```bash
-   git clone <repository-url>
-   cd UAVLogViewer/backend
-   ```
+```bash
+# Create .env file with your OpenAI API key
+echo "OPENAI_API_KEY=your_openai_api_key_here" > .env
 
-2. **Create virtual environment**:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+# Install dependencies
+pip install -r requirements.txt
+```
 
-3. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 2. Start the Backend
 
-4. **Configure environment**:
-   ```bash
-   cp env.example .env
-   # Edit .env file and add your OpenAI API key
-   ```
+```bash
+# Start the server
+python start_server.py
 
-5. **Start the server**:
-   ```bash
-   python start_server.py
-   ```
+# Or run directly
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-   Or run directly with uvicorn:
-   ```bash
-   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-   ```
+### 3. Test the Backend
+
+```bash
+# Check health
+curl http://localhost:8000/health
+
+# Get simulated telemetry data for testing
+curl -X POST http://localhost:8000/test/simulate-frontend-data
+```
+
+## API Endpoints
+
+### Core Endpoints
+
+- `GET /health` - Health check and configuration status
+- `POST /chat` - Main chat endpoint (receives telemetry data + user message)
+- `POST /sessions/{session_id}/telemetry` - Update session telemetry data
+- `GET /sessions/{session_id}` - Get session information
+- `DELETE /sessions/{session_id}` - Clear session history
+
+### Testing Endpoints
+
+- `POST /test/simulate-frontend-data` - Generate sample telemetry data for testing
+
+## Data Flow
+
+```
+Frontend (Vue.js)           Backend (FastAPI + OpenAI)
+┌─────────────────┐        ┌──────────────────────────┐
+│ 1. User uploads │        │                          │
+│    .bin file    │        │                          │
+└─────────────────┘        │                          │
+         │                 │                          │
+┌─────────────────┐        │                          │
+│ 2. JavaScript   │        │                          │
+│    worker parses│        │                          │
+│    telemetry    │        │                          │
+└─────────────────┘        │                          │
+         │                 │                          │
+┌─────────────────┐        │ ┌──────────────────────┐ │
+│ 3. Send parsed  │───────▶│ │ POST /chat           │ │
+│    data + user  │        │ │ - telemetry_data     │ │
+│    question     │        │ │ - message            │ │
+└─────────────────┘        │ │ - session_id         │ │
+         │                 │ └──────────────────────┘ │
+┌─────────────────┐        │           │              │
+│ 5. Display AI   │◀───────│ ┌──────────────────────┐ │
+│    response     │        │ │ 4. OpenAI Analysis   │ │
+└─────────────────┘        │ │ - ArduPilot knowledge│ │
+                           │ │ - Context-aware      │ │
+                           │ │ - Flight analysis    │ │
+                           │ └──────────────────────┘ │
+                           └──────────────────────────┘
+```
+
+## Example Usage
+
+### 1. Frontend Sends Parsed Data
+
+The frontend worker parses a .bin file and sends:
+
+```javascript
+const telemetryData = {
+  messages: {
+    GPS: {
+      time_boot_ms: [1000, 2000, 3000],
+      lat: [40.7128, 40.7129, 40.7130],
+      lng: [-74.0060, -74.0061, -74.0062],
+      alt: [10.5, 12.3, 15.8]
+    },
+    ATT: {
+      time_boot_ms: [1000, 2000, 3000],
+      Roll: [0.1, 0.2, -0.1],
+      Pitch: [0.05, -0.1, 0.15],
+      Yaw: [1.57, 1.58, 1.56]
+    },
+    MODE: {
+      time_boot_ms: [500, 2500],
+      asText: ["STABILIZE", "LOITER"]
+    }
+  },
+  metadata: {
+    startTime: 1640995200000,
+    vehicleType: "Quadcopter",
+    logType: "bin"
+  }
+};
+
+// Send to backend
+fetch('/chat', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    message: "What was the maximum altitude during this flight?",
+    telemetry_data: telemetryData,
+    session_id: "optional-session-id"
+  })
+});
+```
+
+### 2. Backend Response
+
+```json
+{
+  "response": "Based on the GPS data in your flight log, the maximum altitude reached was 15.8 meters, occurring at timestamp 3000ms (3 seconds into the flight). The aircraft showed a steady climb from 10.5m to 15.8m over the first 3 seconds, which indicates a controlled ascent.",
+  "session_id": "abc123-session-id",
+  "conversation_count": 2
+}
+```
+
+## ArduPilot Message Support
+
+The backend has built-in knowledge of 25+ ArduPilot message types including:
+
+| Message | Description |
+|---------|-------------|
+| GPS | Position data - Lat, Lng, Alt, Speed |
+| ATT | Attitude data - Roll, Pitch, Yaw |
+| MODE | Flight mode changes |
+| CURR | Battery/Power data - Voltage, Current |
+| IMU | Inertial measurement unit data |
+| BARO | Barometer readings |
+| MSG | System messages and alerts |
+| PARM | Parameter values |
+| RCIN/RCOUT | RC input/output channels |
+| VIBE | Vibration levels |
+| XKF1-4 | Extended Kalman Filter data |
+
+## Testing Without Frontend
+
+Use the test endpoint to simulate frontend-parsed data:
+
+```bash
+# Get sample data structure
+curl -X POST http://localhost:8000/test/simulate-frontend-data
+
+# Test chat with simulated data
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "Analyze the battery performance",
+    "telemetry_data": {
+      "messages": {
+        "CURR": {
+          "time_boot_ms": [1000, 2000, 3000],
+          "Volt": [12.6, 12.4, 12.2],
+          "Curr": [2.1, 2.3, 2.5]
+        }
+      },
+      "metadata": {
+        "logType": "bin",
+        "vehicleType": "Quadcopter"
+      }
+    }
+  }'
+```
 
 ## Configuration
 
 ### Environment Variables
 
-Create a `.env` file with the following variables:
+- `OPENAI_API_KEY` - Your OpenAI API key (required)
+- `OPENAI_MODEL` - GPT model to use (default: gpt-4)
+- `MAX_TOKENS` - Response length limit (default: 1000)
+- `TEMPERATURE` - Response creativity (default: 0.3)
+- `CORS_ORIGINS` - Allowed origins (default: localhost)
 
-```env
-OPENAI_API_KEY=your_openai_api_key_here
+### Example .env File
+
+```bash
+OPENAI_API_KEY=sk-your-openai-api-key-here
 OPENAI_MODEL=gpt-4
-MAX_TOKENS=2000
-TEMPERATURE=0.7
-HOST=0.0.0.0
-PORT=8000
-RELOAD=true
-LOG_LEVEL=info
+MAX_TOKENS=1500
+TEMPERATURE=0.3
+CORS_ORIGINS=http://localhost:8080,http://localhost:3000
 ```
 
-### API Configuration
-- **Host**: `0.0.0.0` (listens on all interfaces)
-- **Port**: `8000` (default)
-- **CORS**: Configured for frontend origins
-- **File Upload**: Max 100MB, supports .bin, .tlog, .txt files
+## Production Deployment
 
-## API Endpoints
+### Docker Deployment
 
-### Health Check
-```http
-GET /health
-```
-Returns server status and configuration info.
+```bash
+# Build image
+docker build -t uav-chat-backend .
 
-### File Upload
-```http
-POST /upload
-Content-Type: multipart/form-data
-
-Parameters:
-- file: Binary file (.bin, .tlog, .txt)
-- session_id: Optional session identifier
+# Run container
+docker run -p 8000:8000 --env-file .env uav-chat-backend
 ```
 
-Uploads and parses a telemetry file, returning parsing results and session info.
+### Security Considerations
 
-### Chat
-```http
-POST /chat
-Content-Type: application/json
-
-{
-  "message": "What was the maximum altitude during the flight?",
-  "session_id": "session-uuid",
-  "file_data": {} // optional additional data
-}
-```
-
-Sends a message to the chatbot and returns an intelligent response based on the uploaded telemetry data.
-
-### Session Management
-
-#### Create Session
-```http
-POST /sessions
-```
-
-#### Get Session Info
-```http
-GET /sessions/{session_id}
-```
-
-#### Get Conversation History
-```http
-GET /sessions/{session_id}/history
-```
-
-#### Clear Session
-```http
-DELETE /sessions/{session_id}
-```
-
-#### List All Sessions
-```http
-GET /sessions
-```
-
-### Telemetry Analysis
-```http
-POST /telemetry/analyze
-Content-Type: application/json
-
-{
-  "query": "altitude analysis",
-  "messages": {
-    // telemetry message data structure
-  }
-}
-```
-
-Direct telemetry data analysis endpoint for custom queries.
-
-## Usage Examples
-
-### Basic Chat Flow
-
-1. **Upload a flight log**:
-   ```bash
-   curl -X POST "http://localhost:8000/upload" \
-        -H "Content-Type: multipart/form-data" \
-        -F "file=@flight_log.bin"
-   ```
-
-2. **Start chatting**:
-   ```bash
-   curl -X POST "http://localhost:8000/chat" \
-        -H "Content-Type: application/json" \
-        -d '{
-          "message": "What was the total flight time?",
-          "session_id": "your-session-id"
-        }'
-   ```
-
-### Example Questions
-
-The chatbot can answer questions like:
-- "What was the highest altitude reached during the flight?"
-- "When did the GPS signal first get lost?"
-- "What was the maximum battery temperature?"
-- "How long was the total flight time?"
-- "List all critical errors that happened mid-flight."
-- "When was the first instance of RC signal loss?"
-
-## Architecture
-
-### Core Components
-
-1. **FastAPI Application** (`main.py`)
-   - REST API endpoints
-   - Request/response handling
-   - CORS configuration
-
-2. **Chat Service** (`chat_service.py`)
-   - OpenAI API integration
-   - Conversation management
-   - Context formatting
-
-3. **Telemetry Parser** (`telemetry_parser.py`)
-   - Flight data extraction
-   - Statistical analysis
-   - Query processing
-
-4. **Data Models** (`models.py`)
-   - Pydantic schemas
-   - Type definitions
-   - Validation
-
-### Data Flow
-
-```
-Upload File → Parse Telemetry → Store in Session → Chat Query → 
-OpenAI API → Context + Telemetry Data → Intelligent Response
-```
-
-## Integration with Frontend
-
-The backend is designed to integrate seamlessly with the existing Vue.js frontend:
-
-1. **File Upload**: Replace or extend existing file upload to also send data to backend
-2. **Chat Interface**: Add chat UI components that communicate with `/chat` endpoint
-3. **Session Management**: Maintain session IDs between frontend and backend
-4. **Data Sharing**: Backend can receive parsed telemetry data from existing frontend parsers
+- Keep OpenAI API key secure
+- Configure CORS origins appropriately
+- Use HTTPS in production
+- Implement rate limiting if needed
+- Monitor API usage and costs
 
 ## Development
 
-### Adding New Features
+### File Structure
 
-1. **New Analysis Functions**: Add methods to `TelemetryParser` class
-2. **Chat Capabilities**: Extend system prompts and context formatting in `ChatService`
-3. **API Endpoints**: Add new routes in `main.py`
-4. **Data Models**: Define new Pydantic models in `models.py`
+```
+backend/
+├── main.py              # FastAPI application
+├── chat_service.py      # OpenAI integration & conversation management
+├── models.py            # Pydantic data models
+├── config.py            # Configuration management
+├── requirements.txt     # Python dependencies
+├── start_server.py      # Server startup script
+└── README.md           # This file
+```
+
+### Adding New Message Types
+
+To add support for new ArduPilot message types:
+
+1. Update `ardupilot_messages` dict in `chat_service.py`
+2. Add field definitions to `TelemetryMessage` model in `models.py`
+3. Update context formatting in `_format_telemetry_context()`
 
 ### Testing
 
 ```bash
-# Install test dependencies
-pip install pytest pytest-asyncio httpx
+# Run basic health check
+python -c "
+import requests
+r = requests.get('http://localhost:8000/health')
+print(r.json())
+"
 
-# Run tests
-pytest tests/
+# Test with simulated data
+python -c "
+import requests
+data = requests.post('http://localhost:8000/test/simulate-frontend-data').json()
+print('Sample data generated successfully')
+"
 ```
-
-### API Documentation
-
-When the server is running, visit:
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
-
-## Deployment
-
-### Docker Deployment
-
-```dockerfile
-FROM python:3.9-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-EXPOSE 8000
-
-CMD ["python", "start_server.py"]
-```
-
-### Production Considerations
-
-- Use environment variables for all configuration
-- Set up proper logging and monitoring
-- Configure rate limiting for API endpoints
-- Use HTTPS in production
-- Consider using Redis for session storage in multi-instance deployments
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **OpenAI API Key Not Working**
-   - Verify the API key is correct
-   - Check if you have sufficient credits
-   - Ensure the key has proper permissions
+1. **OpenAI API Key Issues**
+   - Verify key is set in `.env` file
+   - Check key has sufficient credits
+   - Ensure key has access to specified model
 
-2. **File Upload Fails**
-   - Check file size (max 100MB)
-   - Verify file format (.bin, .tlog, .txt)
-   - Ensure proper Content-Type headers
+2. **CORS Issues**
+   - Update `CORS_ORIGINS` in config
+   - Check frontend is making requests from allowed origin
 
-3. **CORS Issues**
-   - Update `ALLOWED_ORIGINS` in `config.py`
-   - Ensure frontend is running on allowed origin
+3. **Module Import Errors**
+   - Ensure all dependencies are installed: `pip install -r requirements.txt`
+   - Check Python version compatibility (3.8+)
 
-### Logs and Debugging
+4. **Connection Issues**
+   - Verify server is running on correct port
+   - Check firewall settings
+   - Ensure frontend is pointing to correct backend URL
 
-- Server logs show detailed error information
-- Use `LOG_LEVEL=debug` for verbose logging
-- Check `/health` endpoint for system status
+### Logging
 
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
+The backend includes comprehensive logging. Check logs for:
+- Session creation and updates
+- OpenAI API calls and responses
+- Error details and stack traces
+- Performance metrics
 
 ## License
 
-This project is part of the UAV Log Viewer application. See the main repository for license information. 
+This project is licensed under the same terms as the main UAV Log Viewer project. 
