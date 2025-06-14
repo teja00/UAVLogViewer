@@ -29,7 +29,6 @@ from config import get_settings
 from models import (
     ChatMessage,
     ConversationSession, # Reusing this for session state
-    TelemetryData,
     V2ConversationSession,
 )
 from optimized_parser import parse_bin_file_optimized

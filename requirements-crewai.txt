@@ -1,0 +1,15 @@
+# CrewAI Multi-Role Agent Dependencies
+crewai>=0.130.0
+crewai-tools>=0.47.1
+langchain-openai>=0.2.14  # Still needed for LLM integration
+openai>=1.86.0
+
+# Core dependencies (if not already present)
+pandas>=2.0.0
+numpy<2.0.0  # Use NumPy 1.x for compatibility with existing packages
+pydantic>=2.11.0
+python-dotenv>=1.0.0
+
+# Analysis dependencies for enhanced telemetry analyzer (disabled for now due to NumPy compatibility)
+# scikit-learn>=1.5.0
+# scipy>=1.14.0 

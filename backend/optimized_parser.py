@@ -89,7 +89,7 @@ class OptimizedBinParser:
             mlog = mavutil.mavlink_connection(file_path, dialect="ardupilotmega")
             
             # Batch message reading
-            batch_size = 1000
+            batch_size = 10000
             while True:
                 batch = []
                 for _ in range(batch_size):

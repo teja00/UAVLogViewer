@@ -1,31 +1,62 @@
 """
-FastAPI backend for UAV Log Analyzer Chatbot
+FastAPI backend for UAV Log Analyzer Chatbot V2
 
-This backend receives parsed telemetry data from the frontend and provides
-AI-powered analysis using OpenAI GPT models with ArduPilot knowledge.
+This backend uses the enhanced agentic V2 chat service for analyzing UAV flight telemetry data.
+It processes uploaded log files directly and provides AI-powered analysis using OpenAI GPT models.
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, UploadFile, File
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from typing import Optional
+from datetime import datetime
 import uuid
 import logging
 import tempfile
 import os
+import sys
+import uvicorn
+from dotenv import load_dotenv
 
 from config import get_settings
 from models import (
     ChatRequest,
     ChatResponse,
-    TelemetryData,
     HealthResponse,
-    ErrorResponse,
-    ConversationSession
+    ErrorResponse
 )
-from chat_service import chat_service
-from chat_service_v2 import chat_service_v2
+# Import the new multi-role agent
+from agent.multi_role_agent import MultiRoleAgent
+
+# Create a wrapper to maintain compatibility with existing API
+class ChatServiceV2:
+    """Compatibility wrapper for the multi-role agent."""
+    
+    def __init__(self):
+        self.agent = MultiRoleAgent()
+        
+    async def create_or_get_session(self, session_id=None):
+        return await self.agent.create_or_get_session(session_id)
+        
+    async def process_log_file(self, session_id: str, file_path: str):
+        await self.agent.process_log_file(session_id, file_path)
+        
+    async def chat(self, session_id: str, user_message: str) -> str:
+        return await self.agent.chat(session_id, user_message)
+        
+    @property
+    def sessions(self):
+        return self.agent.sessions
+    
+    def get_performance_stats(self, session_id=None):
+        """Get performance statistics from the multi-role agent."""
+        return self.agent.get_performance_stats(session_id)
+
+# Initialize the multi-role chat service
+chat_service_v2 = ChatServiceV2()
+
+# Load environment variables early
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,9 +64,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="UAV Log Analyzer Chat API",
-    description="AI-powered chatbot for analyzing UAV flight telemetry data",
-    version="2.0.0",
+    title="UAV Log Analyzer Chat API V2",
+    description="Multi-role AI-powered chatbot with Planner→Executor→Critic architecture for analyzing UAV flight telemetry data",
+    version="2.1.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -66,12 +97,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-# Background task to cleanup old sessions
-async def cleanup_sessions():
-    """Background task to cleanup old chat sessions"""
-    chat_service.cleanup_old_sessions(hours=24)
-
-
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
@@ -81,84 +106,17 @@ async def health_check():
     )
 
 
-# --- V1 Endpoints ---
+# === UPLOAD LOG ENDPOINTS ===
 
-@app.post("/chat", response_model=ChatResponse, summary="Chat with Standard V1 Service")
-async def chat_endpoint(
-    request: ChatRequest,
-    background_tasks: BackgroundTasks
-) -> ChatResponse:
-    """
-    Main chat endpoint that receives user messages and telemetry data from frontend.
-    This uses the standard, non-agentic chat service.
-    """
-    try:
-        # Generate session ID if not provided
-        session_id = request.session_id or str(uuid.uuid4())
-        
-        # Clear history if requested
-        if request.clear_history:
-            await chat_service.clear_session_history(session_id)
-            
-        # Update session with telemetry data if provided
-        if request.telemetry_data:
-            await chat_service.update_session_telemetry(session_id, request.telemetry_data)
-            
-        # Get AI response
-        response_text = await chat_service.chat(session_id, request.message)
-        
-        # Get session info
-        session = chat_service.get_session(session_id)
-        conversation_count = len(session.messages) if session else 0
-        
-        # Schedule cleanup task
-        background_tasks.add_task(cleanup_sessions)
-        
-        return ChatResponse(
-            response=response_text,
-            session_id=session_id,
-            conversation_count=conversation_count
-        )
-        
-    except Exception as e:
-        logger.error(f"Chat endpoint error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process chat request: {str(e)}"
-        )
-
-
-@app.post("/sessions/{session_id}/telemetry", summary="Upload Telemetry for V1 Service")
-async def update_session_telemetry(
-    session_id: str,
-    telemetry_data: TelemetryData
-):
-    """
-    Update telemetry data for an existing V1 session.
-    """
-    try:
-        await chat_service.update_session_telemetry(session_id, telemetry_data)
-        return {"message": "Telemetry data updated successfully"}
-        
-    except Exception as e:
-        logger.error(f"Telemetry update error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to update telemetry data: {str(e)}"
-        )
-
-
-# --- V2 Agentic Chat Endpoints ---
-
-@app.post("/v2/sessions/upload-log", summary="Upload a log file for V2 analysis")
-async def upload_log_file_v2(
+@app.post("/sessions/upload-log", summary="Upload a log file for analysis")
+async def upload_log_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...)
 ):
     """
     Uploads a flight log file (.bin, .tlog), starts a background processing
     task to convert it into pandas DataFrames, and returns a session ID
-    for the V2 chat service.
+    for the chat service.
     """
     session_id = str(uuid.uuid4())
     
@@ -190,19 +148,30 @@ async def upload_log_file_v2(
         )
 
 
-@app.post("/v2/chat", response_model=ChatResponse, summary="Chat with V2 Agentic Service")
-async def chat_v2(
+# V2 alias for backward compatibility
+@app.post("/v2/sessions/upload-log", summary="Upload a log file for analysis (V2 alias)")
+async def upload_log_file_v2_alias(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """V2 alias for backward compatibility"""
+    return await upload_log_file(background_tasks, file)
+
+
+# === CHAT ENDPOINTS ===
+
+@app.post("/chat", response_model=ChatResponse, summary="Chat with V2 Agentic Service")
+async def chat(
     chat_request: ChatRequest,
 ):
     """
     Agentic chat endpoint that uses tool-calling to analyze telemetry data.
     Assumes that telemetry data has already been loaded into the session
-    using the `/v2/sessions/upload-log` endpoint.
-    The `telemetry_data` field in the request body is ignored.
+    using the `/sessions/upload-log` endpoint.
     """
     try:
         if not chat_request.session_id:
-            raise HTTPException(status_code=400, detail="A 'session_id' is required for V2 chat.")
+            raise HTTPException(status_code=400, detail="A 'session_id' is required for chat.")
 
         # Get AI response from the V2 service
         response_text = await chat_service_v2.chat(chat_request.session_id, chat_request.message)
@@ -218,40 +187,31 @@ async def chat_v2(
         )
         
     except Exception as e:
-        logger.error("V2 Chat endpoint error", exc_info=True)
+        logger.error("Chat endpoint error", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to process V2 chat request: {str(e)}"
+            detail=f"Failed to process chat request: {str(e)}"
         )
 
 
-# --- Common Session Endpoints ---
+# V2 alias for backward compatibility
+@app.post("/v2/chat", response_model=ChatResponse, summary="Chat with V2 Agentic Service (V2 alias)")
+async def chat_v2_alias(
+    chat_request: ChatRequest,
+):
+    """V2 alias for backward compatibility"""
+    return await chat(chat_request)
+
+
+# === SESSION MANAGEMENT ENDPOINTS ===
 
 @app.get("/sessions/{session_id}")
 async def get_session_info(session_id: str):
     """
-    Get information about a chat session. Note: This currently only inspects V1 sessions.
-    """
-    session = chat_service.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-        
-    return {
-        "session_id": session.session_id,
-        "message_count": len(session.messages),
-        "has_telemetry_data": session.telemetry_data is not None,
-        "created_at": session.created_at.isoformat(),
-        "last_updated": session.last_updated.isoformat()
-    }
-
-
-@app.get("/v2/sessions/{session_id}")
-async def get_v2_session_info(session_id: str):
-    """
-    Get information about a V2 chat session including processing status and dataframes.
+    Get information about a chat session including processing status and dataframes.
     """
     if session_id not in chat_service_v2.sessions:
-        raise HTTPException(status_code=404, detail="V2 Session not found")
+        raise HTTPException(status_code=404, detail="Session not found")
     
     session = chat_service_v2.sessions[session_id]
     
@@ -268,13 +228,27 @@ async def get_v2_session_info(session_id: str):
     }
 
 
+# V2 alias for backward compatibility
+@app.get("/v2/sessions/{session_id}")
+async def get_session_info_v2_alias(session_id: str):
+    """V2 alias for backward compatibility"""
+    return await get_session_info(session_id)
+
+
 @app.delete("/sessions/{session_id}")
 async def clear_session(session_id: str):
     """
-    Clear conversation history for a V1 session (keeps telemetry data).
+    Clear conversation history for a session (keeps telemetry data).
     """
+    if session_id not in chat_service_v2.sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
     try:
-        await chat_service.clear_session_history(session_id)
+        session = chat_service_v2.sessions[session_id]
+        # Clear messages but keep dataframes and other session data
+        session.messages = []
+        session.last_updated = datetime.now()
+        
         return {"message": "Session history cleared successfully"}
         
     except Exception as e:
@@ -285,42 +259,55 @@ async def clear_session(session_id: str):
         )
 
 
-@app.post("/test/simulate-frontend-data")
-async def simulate_frontend_data():
-    """
-    Test endpoint that simulates frontend-parsed telemetry data.
-    This helps test the backend without needing the full frontend.
-    """
-    
-    # Simulate typical frontend-parsed telemetry data structure
-    simulated_data = TelemetryData(
-        messages={
-            "GPS": {
-                "time_boot_ms": [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
-                "lat": [40.7128, 40.7129, 40.7130, 40.7131, 40.7132, 40.7133, 40.7134, 40.7135, 40.7136, 40.7137],
-                "lng": [-74.0060, -74.0061, -74.0062, -74.0063, -74.0064, -74.0065, -74.0066, -74.0067, -74.0068, -74.0069],
-                "alt": [10.5, 12.3, 15.8, 18.2, 20.1, 22.5, 25.0, 27.3, 30.1, 32.8]
-            },
-            "ATT": {
-                "time_boot_ms": [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
-                "Roll": [0.1, 0.2, -0.1, 0.3, -0.2, 0.4, -0.3, 0.1, 0.2, -0.1],
-                "Pitch": [0.05, -0.1, 0.15, -0.05, 0.08, -0.12, 0.18, -0.08, 0.06, 0.02],
-                "Yaw": [1.57, 1.58, 1.56, 1.59, 1.55, 1.60, 1.54, 1.58, 1.57, 1.56]
-            }
-        },
-        metadata={
-            "startTime": 1640995200000,
-            "vehicleType": "Quadcopter",
-            "logType": "bin",
-            "duration": 10.0,
-            "messageCount": 42
+# V2 alias for backward compatibility
+@app.delete("/v2/sessions/{session_id}")
+async def clear_session_v2_alias(session_id: str):
+    """V2 alias for backward compatibility"""
+    return await clear_session(session_id)
+
+
+# === PERFORMANCE MONITORING ENDPOINTS ===
+
+@app.get("/performance/stats")
+async def get_overall_performance_stats():
+    """Get overall performance statistics for the multi-role agent."""
+    try:
+        stats = chat_service_v2.get_performance_stats()
+        return {
+            "status": "success",
+            "stats": stats,
+            "timestamp": datetime.now().isoformat()
         }
-    )
-    
-    return {
-        "message": "Simulated telemetry data generated",
-        "data": simulated_data.dict(),
-    }
+    except Exception as e:
+        logger.error(f"Error getting performance stats: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get performance stats: {str(e)}"
+        )
+
+
+@app.get("/performance/stats/{session_id}")
+async def get_session_performance_stats(session_id: str):
+    """Get performance statistics for a specific session."""
+    try:
+        if session_id not in chat_service_v2.sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+            
+        stats = chat_service_v2.get_performance_stats(session_id)
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "stats": stats,
+            "timestamp": datetime.now().isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session performance stats: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get session performance stats: {str(e)}"
+        )
 
 
 @app.exception_handler(Exception)
@@ -336,6 +323,40 @@ async def global_exception_handler(request, exc):
     )
 
 
+def start_server():
+    """Start the FastAPI server with proper configuration."""
+    
+    # Check if OpenAI API key is configured
+    if not os.getenv("OPENAI_API_KEY"):
+        print("WARNING: OPENAI_API_KEY not found in environment variables!")
+        print("Please set your OpenAI API key in a .env file or environment variables.")
+        print("Copy env.example to .env and add your API key.")
+        print()
+        
+    # Server configuration
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    reload = os.getenv("RELOAD", "true").lower() == "true"
+    log_level = os.getenv("LOG_LEVEL", "info")
+    
+    print("Starting UAV Log Viewer Chatbot Backend V2...")
+    print(f"Server will be available at: http://{host}:{port}")
+    print(f"API Documentation: http://{host}:{port}/docs")
+    print(f"ReDoc Documentation: http://{host}:{port}/redoc")
+    print("")
+    
+    try:
+        app_import = "main:app"
+        if reload:
+            uvicorn.run(app_import, host=host, port=port, reload=True, log_level=log_level)
+        else:
+            uvicorn.run(app, host=host, port=port, reload=False, log_level=log_level)
+    except KeyboardInterrupt:
+        print("\nServer stopped by user.")
+    except Exception as e:
+        print(f"Error starting server: {e}")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    start_server() 
