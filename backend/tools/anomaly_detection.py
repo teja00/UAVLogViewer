@@ -108,20 +108,29 @@ class AnomalyDetector:
                     max_hdop = gps_df['HDop'].max()
                     issues['warning'].append(f"Poor GPS precision: max HDOP {max_hdop:.1f}")
             
-            # Check for altitude jumps
+            # === Dynamic altitude-jump detection ===
             if 'Alt' in gps_df.columns and len(gps_df) > 1:
-                alt_diff = gps_df['Alt'].diff().abs()
-                large_jumps = alt_diff[alt_diff > 50]
-                if len(large_jumps) > 0:
-                    max_jump = alt_diff.max()
-                    issues['warning'].append(f"GPS altitude jumps detected: max {max_jump:.1f}m")
+                alt_diff = gps_df['Alt'].diff().abs().dropna()
+                if not alt_diff.empty:
+                    jump_threshold = alt_diff.mean() + 3 * alt_diff.std()
+                    large_jumps = alt_diff[alt_diff > jump_threshold]
+                    if not large_jumps.empty:
+                        max_jump = large_jumps.max()
+                        issues['warning'].append(
+                            f"Sudden altitude jumps detected: max {max_jump:.1f} m (>3σ={jump_threshold:.1f})"
+                        )
             
-            # Check ground speed anomalies
+            # === Dynamic ground-speed anomalies ===
             if 'Spd' in gps_df.columns:
-                high_speed = gps_df[gps_df['Spd'] > 50]
-                if len(high_speed) > 0:
-                    max_speed = gps_df['Spd'].max()
-                    issues['warning'].append(f"High speed readings: max {max_speed:.1f} m/s")
+                speeds = gps_df['Spd'].dropna()
+                if not speeds.empty:
+                    speed_thresh = speeds.mean() + 3 * speeds.std()
+                    high_speed = speeds[speeds > speed_thresh]
+                    if not high_speed.empty:
+                        max_speed = high_speed.max()
+                        issues['warning'].append(
+                            f"Unusually high ground speed: {max_speed:.1f} m/s (>3σ={speed_thresh:.1f})"
+                        )
             
         except Exception as e:
             issues['warning'].append(f"GPS analysis error: {str(e)}")
@@ -165,21 +174,38 @@ class AnomalyDetector:
         issues = {'critical': [], 'warning': [], 'info': []}
         
         try:
-            # Check battery voltage
+            # === Dynamic battery-voltage thresholds ===
             if 'Volt' in curr_df.columns:
-                min_volt = curr_df['Volt'].min()
-                if min_volt < 10.5:
-                    issues['critical'].append(f"Low battery voltage: {min_volt:.1f}V")
-                elif min_volt < 11.1:
-                    issues['warning'].append(f"Battery voltage getting low: {min_volt:.1f}V")
-            
-            # Check current spikes
+                voltages = curr_df['Volt'].dropna()
+                if not voltages.empty:
+                    # Critical if in the lowest 2 percentile, warning if in lowest 10 percentile
+                    crit_thresh = voltages.quantile(0.02)
+                    warn_thresh = voltages.quantile(0.10)
+                    min_volt = voltages.min()
+
+                    if min_volt <= crit_thresh:
+                        issues['critical'].append(
+                            f"Low battery voltage: {min_volt:.1f} V (≤ {crit_thresh:.1f} V 2 % quantile)"
+                        )
+                    elif min_volt <= warn_thresh:
+                        issues['warning'].append(
+                            f"Battery voltage dropped to {min_volt:.1f} V (≤ {warn_thresh:.1f} V 10 % quantile)"
+                        )
+
+            # === Current spike detection using robust z-score ===
             if 'Curr' in curr_df.columns:
-                max_current = curr_df['Curr'].max()
-                mean_current = curr_df['Curr'].mean()
-                if max_current > mean_current * 3:
-                    issues['warning'].append(f"Current spikes: max {max_current:.1f}A (avg {mean_current:.1f}A)")
-                    
+                currents = curr_df['Curr'].dropna()
+                if not currents.empty:
+                    mean_curr = currents.mean()
+                    std_curr = currents.std() if currents.std() > 0 else 1
+                    spike_threshold = mean_curr + 3 * std_curr
+                    max_curr = currents.max()
+
+                    if max_curr > spike_threshold:
+                        issues['warning'].append(
+                            f"Current spike: {max_curr:.1f} A (mean {mean_curr:.1f} A, >3σ threshold {spike_threshold:.1f} A)"
+                        )
+            
         except Exception as e:
             issues['warning'].append(f"Power analysis error: {str(e)}")
         

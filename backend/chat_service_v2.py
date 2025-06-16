@@ -1263,16 +1263,24 @@ DATA: {len(session.dataframes)} data types, {len(session.dataframes)} records.""
             if not phase_data:
                 return f"Could not identify {phase} phase in flight data."
             
-            result = f"{phase.upper()} PHASE ANALYSIS:\n"
-            result += f"Duration: {phase_data['duration']:.1f} minutes\n"
-            result += f"Time range: {phase_data['start_time']} - {phase_data['end_time']}\n\n"
-            
-            # Analyze requested metrics
+            # Generate concise, bullet-point style summary for the phase
+            result_lines = [
+                f"{phase.title()} phase:",
+                f"• Duration: {phase_data['duration']:.1f} min",
+                f"• Time: {phase_data['start_time']} – {phase_data['end_time']}"
+            ]
+
+            # Analyze requested metrics and append their concise outputs
             for metric in metrics:
                 metric_analysis = self._analyze_phase_metric(session, phase_data, metric)
-                result += f"{metric_analysis}\n"
-            
-            return result
+                # Ensure each metric analysis is bullet-point formatted for consistency
+                if metric_analysis:
+                    # If the analysis is not already formatted, add a bullet prefix
+                    if not metric_analysis.strip().startswith("•"):
+                        metric_analysis = "• " + metric_analysis.strip()
+                    result_lines.append(metric_analysis)
+
+            return "\n".join(result_lines) + "\n"
             
         except Exception as e:
             return f"Error analyzing {phase} phase: {str(e)}"
