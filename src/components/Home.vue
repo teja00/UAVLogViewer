@@ -70,10 +70,20 @@ export default {
     name: 'Home',
     created () {
         this.$eventHub.$on('messagesDoneLoading', this.extractFlightData)
-        this.state.messages = {}
-        this.state.timeAttitude = []
-        this.state.timeAttitudeQ = []
-        this.state.currentTrajectory = []
+        // Only initialize these if they haven't been set yet
+        // Don't reset during file upload process
+        if (!this.state.messages) {
+            this.state.messages = {}
+        }
+        if (!this.state.timeAttitude) {
+            this.state.timeAttitude = []
+        }
+        if (!this.state.timeAttitudeQ) {
+            this.state.timeAttitudeQ = []
+        }
+        if (!this.state.currentTrajectory) {
+            this.state.currentTrajectory = []
+        }
         isOnline().then(a => { this.state.isOnline = a })
     },
     beforeDestroy () {

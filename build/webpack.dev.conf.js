@@ -40,14 +40,18 @@ const devWebpackConfig = merge(baseWebpackConfig, {
         ? { warnings: false, errors: true }
         : false,
         logging: 'warn',
-
+        // Disable live reload to prevent automatic page refreshes
+        webSocketTransport: 'ws',
+        progress: false,
     },
     historyApiFallback: {
       rewrites: [
         { from: /.*/, to: path.posix.join(config.dev.assetsPublicPath, 'index.html') },
       ],
     },
-    hot: true,
+    // Disable hot reload to prevent aggressive UI resets
+    hot: false,
+    liveReload: false,
     static: "./",
     compress: true,
     host: HOST || config.dev.host,
@@ -55,6 +59,13 @@ const devWebpackConfig = merge(baseWebpackConfig, {
     open: config.dev.autoOpenBrowser,
    // publicPath: config.dev.assetsPublicPath,
     proxy: config.dev.proxyTable,
+    // Disable watch options that cause aggressive refreshing
+    watchFiles: {
+      options: {
+        ignored: /node_modules/,
+        usePolling: false,
+      },
+    },
   },
   plugins: [
     new ESLintPlugin({fix: true}),
@@ -63,7 +74,7 @@ const devWebpackConfig = merge(baseWebpackConfig, {
       '_COMMIT_': JSON.stringify(gitRevisionPlugin.commithash()),
       '_BUILDDATE_': JSON.stringify((new Date().toString()))
     }),
-    new webpack.HotModuleReplacementPlugin(),
+    // Removed HotModuleReplacementPlugin to prevent aggressive reloads
     new webpack.NoEmitOnErrorsPlugin(),
     // https://github.com/ampedandwired/html-webpack-plugin
     new HtmlWebpackPlugin({

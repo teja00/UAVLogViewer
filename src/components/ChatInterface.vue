@@ -248,30 +248,73 @@ export default {
         this.setupKeyboardShortcuts()
     },
     beforeDestroy () {
-        this.stopProcessingPolling()
+        try {
+            this.stopProcessingPolling()
+            // Clean up event listeners
+            this.$eventHub.$off('v2-session-created')
+            this.$eventHub.$off('v2-session-error')
+        } catch (error) {
+            console.error('Error during ChatInterface cleanup:', error)
+        }
+    },
+
+    errorCaptured (err, vm, info) {
+        console.error('ChatInterface error captured:', err, info)
+        // Prevent error from propagating up and potentially causing page reload
+        return false
     },
     created () {
         // Keep all existing event handlers
         this.$eventHub.$on('v2-session-created', (sessionId) => {
             console.log(`ChatInterface received v2-session-created event with session ID: ${sessionId}`)
-            this.isProcessing = true
-            this.isReadyForChat = false
-            this.messages = []
-            this.addMessage('bot', 'Your flight log is being processed. Please wait while we analyze your data...')
-            this.startProcessingPolling()
+            try {
+                this.isProcessing = true
+                this.isReadyForChat = false
+                this.messages = []
+                this.addMessage('bot', 'Your flight log is being processed. Please wait while we analyze your data...')
+                this.startProcessingPolling()
+            } catch (error) {
+                console.error('Error handling v2-session-created event:', error)
+            }
         })
 
         this.$eventHub.$on('v2-session-error', (errorMessage) => {
-            this.isProcessing = false
-            this.isReadyForChat = false
-            this.state.v2Processing = false
-            this.messages = []
-            this.addMessage('bot', `An error occurred: ${errorMessage}`)
-            this.stopProcessingPolling()
+            console.log('ChatInterface received v2-session-error event:', errorMessage)
+            try {
+                this.isProcessing = false
+                // Don't immediately reset everything - give user a chance to retry
+                setTimeout(() => {
+                    if (!this.isReadyForChat) {
+                        this.state.v2Processing = false
+                    }
+                }, 2000)
+
+                // Only reset messages if we don't have an existing conversation
+                if (this.messages.length === 0) {
+                    this.addMessage('bot', `Upload failed: ${errorMessage}. Please try uploading your log file again.`)
+                } else {
+                    this.addMessage('bot', `Connection issue: ${errorMessage}`)
+                }
+                this.stopProcessingPolling()
+            } catch (error) {
+                console.error('Error handling v2-session-error event:', error)
+            }
         })
 
         this.$watch('state.file', (newFile, oldFile) => {
-            if (newFile !== oldFile) {
+            console.log('File state changed:', { oldFile, newFile })
+
+            // Only reset UI state when explicitly removing file or uploading a completely different file
+            // Be more conservative to prevent unnecessary resets
+            const shouldReset = (newFile !== oldFile) && (
+                newFile === null || // File explicitly removed (null)
+                (oldFile !== null && newFile !== null && oldFile !== newFile) // Different file uploaded
+            )
+
+            console.log('Should reset chat interface:', shouldReset)
+
+            if (shouldReset) {
+                console.log('Resetting chat interface due to file change')
                 this.isExpanded = false
                 this.isReadyForChat = false
                 this.isProcessing = false
@@ -442,11 +485,15 @@ export default {
                 }
             } catch (error) {
                 console.error('Status check error:', error)
+                // Don't reset everything on network errors - be more resilient
+                // Only stop polling and set processing to false, but keep chat intact
                 this.stopProcessingPolling()
                 this.isProcessing = false
-                this.isReadyForChat = false
-                this.messages = []
-                this.addMessage('bot', 'Failed to check processing status. Please try reloading the log file.')
+
+                // Only show error if we don't have an active chat session
+                if (!this.isReadyForChat && this.messages.length === 0) {
+                    this.addMessage('bot', 'Connection issue while checking status. Your log is likely still being processed.')
+                }
             }
         },
 

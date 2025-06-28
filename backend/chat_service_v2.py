@@ -147,10 +147,27 @@ class ChatServiceV2:
         """
         Generate a comprehensive summary of the available data for better context.
         """
+        # Ensure we always return a valid dictionary even if session or dataframes are None/empty
+        if not session or not hasattr(session, 'dataframes') or not session.dataframes:
+            return {
+                "message_types": 0,
+                "total_records": 0,
+                "time_range": {
+                    "start": "Unknown",
+                    "end": "Unknown", 
+                    "duration_minutes": 0
+                },
+                "key_metrics": {}
+            }
+        
         summary = {
             "message_types": len(session.dataframes),
             "total_records": sum(len(df) for df in session.dataframes.values()),
-            "time_range": None,
+            "time_range": {
+                "start": "Unknown",
+                "end": "Unknown",
+                "duration_minutes": 0
+            },
             "key_metrics": {}
         }
         
@@ -185,6 +202,13 @@ class ChatServiceV2:
             
         except Exception as e:
             logger.debug(f"Error generating data summary: {e}")
+            # Ensure we still have a valid time_range structure
+            if "time_range" not in summary or summary["time_range"] is None:
+                summary["time_range"] = {
+                    "start": "Unknown",
+                    "end": "Unknown",
+                    "duration_minutes": 0
+                }
         
         return summary
 

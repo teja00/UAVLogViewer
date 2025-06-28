@@ -170,12 +170,15 @@ export default {
             formData.append('file', file)
 
             try {
+                console.log(`Uploading file ${file.name} to backend at ${this.backendUrl}`)
                 this.state.v2Processing = true
 
                 const response = await fetch(`${this.backendUrl}/v2/sessions/upload-log`, {
                     method: 'POST',
                     body: formData
                 })
+
+                console.log(`Upload response status: ${response.status}`)
 
                 if (!response.ok) {
                     const errorData = await response.json()
@@ -188,15 +191,26 @@ export default {
                 this.$eventHub.$emit('v2-session-created', sessionId)
             } catch (error) {
                 console.error('Error uploading log file for V2 analysis:', error)
-                this.state.v2Processing = false
+                // Don't reset v2Processing immediately - let the user retry
+                // Only set to false after a delay to prevent UI flickering
+                setTimeout(() => {
+                    this.state.v2Processing = false
+                }, 1000)
                 this.$eventHub.$emit('v2-session-error', error.message)
             }
         },
         process: function (file) {
+            // Set the file and state variables
             this.state.file = file.name
             this.state.processStatus = 'Pre-processing...'
             this.state.processPercentage = 100
             this.file = file
+            this.state.logType = file.name.endsWith('tlog') ? 'tlog' : 'bin'
+            if (file.name.endsWith('.txt')) {
+                this.state.logType = 'dji'
+            }
+
+            // Process file locally using the worker
             const reader = new FileReader()
             reader.onload = function (e) {
                 const data = reader.result
@@ -207,14 +221,13 @@ export default {
                     isDji: (file.name.endsWith('txt'))
                 })
             }
-            this.state.logType = file.name.endsWith('tlog') ? 'tlog' : 'bin'
-            if (file.name.endsWith('.txt')) {
-                this.state.logType = 'dji'
-            }
             reader.readAsArrayBuffer(file)
 
-            // Upload the file to the V2 backend for processing
-            this.uploadLogForV2(file)
+            // Also upload the file to the V2 backend for chat processing
+            // This should happen after setting the file state
+            this.$nextTick(() => {
+                this.uploadLogForV2(file)
+            })
         },
         uploadFile () {
             // This function is not needed for local file processing

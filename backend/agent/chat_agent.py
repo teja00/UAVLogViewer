@@ -148,6 +148,14 @@ class MultiRoleChatAgent:
     async def _planner_role(self, session: V2ConversationSession, user_message: str) -> ExecutionPlan:
         """Planner role: Analyzes user request and creates structured execution plan."""
         data_summary = get_data_summary(session)
+        # Additional safety check to ensure data_summary is never None
+        if data_summary is None:
+            data_summary = {
+                "message_types": 0,
+                "total_records": 0,
+                "time_range": {"duration_minutes": 0},
+                "key_metrics": {}
+            }
         available_tools = get_tool_definitions()
         
         planner_prompt = self._get_planner_prompt(data_summary, available_tools)
@@ -189,6 +197,14 @@ class MultiRoleChatAgent:
     async def _executor_role(self, session: V2ConversationSession, user_message: str, plan: ExecutionPlan) -> str:
         """Executor role: Follows the plan and executes tools to generate analysis."""
         data_summary = get_data_summary(session)
+        # Additional safety check to ensure data_summary is never None
+        if data_summary is None:
+            data_summary = {
+                "message_types": 0,
+                "total_records": 0,
+                "time_range": {"duration_minutes": 0},
+                "key_metrics": {}
+            }
         executor_prompt = self._get_executor_prompt(data_summary, plan)
         
         start_time = datetime.now()
@@ -277,6 +293,14 @@ class MultiRoleChatAgent:
                           draft_answer: str, plan: ExecutionPlan) -> str:
         """Critic role: Reviews draft answer for quality, accuracy, and completeness."""
         data_summary = get_data_summary(session)
+        # Additional safety check to ensure data_summary is never None
+        if data_summary is None:
+            data_summary = {
+                "message_types": 0,
+                "total_records": 0,
+                "time_range": {"duration_minutes": 0},
+                "key_metrics": {}
+            }
         critic_prompt = self._get_critic_prompt(data_summary, plan)
         
         start_time = datetime.now()
