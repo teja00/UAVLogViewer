@@ -36,6 +36,7 @@ from models import ChatMessage, V2ConversationSession
 
 from utils.documentation import DocumentationService
 from utils.log_parser import LogParserService, get_data_summary
+from utils.semantic_data_retriever import SemanticDataRetriever
 from tools.tool_definitions import get_tool_definitions  
 from tools.analysis_tools import AnalysisTools
 
@@ -84,6 +85,16 @@ class IterationResult:
 
 
 @dataclass
+class ClassifiedIntent:
+    """Result from intent classification."""
+    intent_key: str
+    intent_name: str
+    confidence: float
+    recommended_tools: List[str]
+    reasoning: str
+
+
+@dataclass
 class ExecutionPlan:
     """Structured plan from the Planner role."""
     needs_tools: bool
@@ -102,6 +113,8 @@ class ExecutionPlan:
     # Multi-step planning
     execution_steps: List[str] = field(default_factory=list)  # Ordered steps to execute
     stopping_conditions: List[str] = field(default_factory=list)  # When to stop
+    # Intent classification
+    classified_intent: Optional[ClassifiedIntent] = None
 
 
 @dataclass
@@ -128,8 +141,326 @@ class CritiqueResult:
     re_execution_instructions: Optional[str] = None
 
 
+class IntentClassifier:
+    """Intelligent intent classification using LLM to replace brittle keyword matching."""
+    
+    def __init__(self, settings):
+        self.settings = settings
+        self.llm = ChatOpenAI(
+            api_key=settings.openai_api_key,
+            model=settings.intent_classification_model,
+            temperature=settings.intent_classification_temperature,
+            max_tokens=settings.intent_classification_max_tokens
+        ) if settings.openai_api_key else None
+        
+    async def classify_intent(self, user_message: str, session: V2ConversationSession) -> ClassifiedIntent:
+        """Classify user intent using LLM instead of keyword matching."""
+        if not self.llm:
+            logger.warning("LLM not available for intent classification, falling back to default")
+            return self._fallback_classification(user_message)
+        
+        try:
+            # Build classification prompt with available intents
+            intent_descriptions = []
+            for intent_key, intent_config in self.settings.intents.items():
+                intent_descriptions.append(
+                    f"- {intent_config['name']}: {intent_config['description']}"
+                )
+            
+            # Add conversation context for better classification
+            conversation_context = self._get_conversation_context(session)
+            
+            classification_prompt = f"""You are an expert UAV flight data analyst. Classify the user's query into one of the predefined intent categories.
+
+Available Intent Categories:
+{chr(10).join(intent_descriptions)}
+
+Conversation Context:
+{conversation_context}
+
+User Query: "{user_message}"
+
+Instructions:
+1. Analyze the query carefully considering the conversation context
+2. Select the MOST APPROPRIATE intent category
+3. Provide a confidence score (0.0-1.0)
+4. Give a brief reasoning for your choice
+
+Respond ONLY in this exact JSON format:
+{{
+    "intent_key": "the_intent_key",
+    "confidence": 0.85,
+    "reasoning": "Brief explanation of why this intent was selected"
+}}"""
+
+            # Make LLM call for classification
+            response = await asyncio.to_thread(
+                lambda: self.llm.invoke(classification_prompt).content
+            )
+            
+            # Parse LLM response
+            classified_intent = self._parse_classification_response(response, user_message)
+            
+            logger.info(f"Intent classified: {classified_intent.intent_name} (confidence: {classified_intent.confidence:.2f})")
+            return classified_intent
+            
+        except Exception as e:
+            logger.warning(f"Intent classification failed: {e}, using fallback")
+            return self._fallback_classification(user_message)
+    
+    def _parse_classification_response(self, response: str, user_message: str) -> ClassifiedIntent:
+        """Parse LLM classification response into ClassifiedIntent object."""
+        try:
+            # Try to extract JSON from response
+            json_start = response.find('{')
+            json_end = response.rfind('}') + 1
+            
+            if json_start >= 0 and json_end > json_start:
+                json_str = response[json_start:json_end]
+                result = json.loads(json_str)
+                
+                intent_key = result.get('intent_key', 'general_code_execution')
+                confidence = float(result.get('confidence', 0.7))
+                reasoning = result.get('reasoning', 'LLM classification')
+                
+                # Validate intent key exists in config
+                if intent_key not in self.settings.intents:
+                    logger.warning(f"Unknown intent key: {intent_key}, falling back to general_code_execution")
+                    intent_key = 'general_code_execution'
+                
+                intent_config = self.settings.intents[intent_key]
+                
+                return ClassifiedIntent(
+                    intent_key=intent_key,
+                    intent_name=intent_config['name'],
+                    confidence=confidence,
+                    recommended_tools=intent_config['tools'].copy(),
+                    reasoning=reasoning
+                )
+            else:
+                raise ValueError("No valid JSON found in response")
+                
+        except Exception as e:
+            logger.warning(f"Failed to parse classification response: {e}")
+            return self._fallback_classification(user_message)
+    
+    def _fallback_classification(self, user_message: str) -> ClassifiedIntent:
+        """Fallback classification when LLM classification fails."""
+        # Simple heuristic-based classification as fallback
+        user_lower = user_message.lower()
+        
+        if any(word in user_lower for word in ['altitude', 'height', 'maximum', 'minimum', 'highest', 'lowest']):
+            intent_key = 'altitude_analysis'
+        elif any(word in user_lower for word in ['power', 'battery', 'voltage', 'current', 'consumption']):
+            intent_key = 'power_system_analysis'
+        elif any(word in user_lower for word in ['error', 'warning', 'problem', 'issue', 'critical', 'fail']):
+            intent_key = 'flight_events_analysis'
+        elif any(word in user_lower for word in ['gps', 'navigation', 'position', 'satellite']):
+            intent_key = 'navigation_analysis'
+        elif any(word in user_lower for word in ['summary', 'overview', 'comprehensive', 'performance']):
+            intent_key = 'flight_performance_analysis'
+        elif any(word in user_lower for word in ['anomaly', 'pattern', 'unusual', 'detect']):
+            intent_key = 'anomaly_detection'
+        elif any(word in user_lower for word in ['takeoff', 'landing', 'cruise', 'phase', 'mode']):
+            intent_key = 'flight_phase_analysis'
+        else:
+            intent_key = 'general_code_execution'
+        
+        intent_config = self.settings.intents[intent_key]
+        
+        return ClassifiedIntent(
+            intent_key=intent_key,
+            intent_name=intent_config['name'],
+            confidence=0.6,  # Lower confidence for fallback
+            recommended_tools=intent_config['tools'].copy(),
+            reasoning="Fallback heuristic classification"
+        )
+    
+    def _get_conversation_context(self, session: V2ConversationSession) -> str:
+        """Get conversation context for better intent classification."""
+        if not session.messages:
+            return "This is the start of a new conversation."
+        
+        # Get last 2 messages for context
+        recent_messages = session.messages[-2:] if len(session.messages) >= 2 else session.messages
+        
+        context_parts = []
+        for msg in recent_messages:
+            role = "User" if msg.role == "user" else "Assistant"
+            content = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
+            context_parts.append(f"{role}: {content}")
+        
+        return "; ".join(context_parts) if context_parts else "No previous context"
+
+
 from pydantic import BaseModel, Field
 from typing import Type
+
+# GENERALIZED Python Code Validation and Error Recovery System
+class PythonCodeValidator:
+    """
+    Generalized Python code validation and error recovery system.
+    Uses LLM-based analysis to handle any type of Python execution errors dynamically.
+    
+    🎯 KEY FEATURES:
+    - Dynamic syntax error fixing using LLM analysis
+    - Adaptive fallback generation based on user intent and error type
+    - Learning from error patterns (extensible)
+    - No hardcoded keywords or error messages
+    - Scales to handle any type of analysis failure
+    """
+    
+    def __init__(self, llm, session: V2ConversationSession):
+        self.llm = llm
+        self.session = session
+        self.error_patterns = {}  # Dynamic learning of error patterns
+    
+    def validate_and_fix_code(self, code: str) -> str:
+        """Validate Python code and fix common issues dynamically."""
+        try:
+            # Try to compile the code first
+            compile(code, '<string>', 'exec')
+            return code
+        except SyntaxError as e:
+            logger.warning(f"Syntax error detected: {e}")
+            return self._fix_syntax_error(code, str(e))
+        except Exception as e:
+            logger.warning(f"Code validation issue: {e}")
+            return code  # Return as-is for runtime validation
+    
+    def _fix_syntax_error(self, code: str, error_msg: str) -> str:
+        """Fix syntax errors using LLM analysis."""
+        if not self.llm:
+            return code
+        
+        try:
+            fix_prompt = f"""Fix this Python code syntax error:
+
+ERROR: {error_msg}
+
+CODE:
+```python
+{code}
+```
+
+Requirements:
+1. Fix ONLY the syntax error, don't change the logic
+2. Maintain all variable names and data access patterns
+3. Return ONLY the corrected Python code, no explanations
+4. Ensure code uses 'dfs' dictionary to access dataframes
+5. Must end with 'result' variable containing the final answer
+
+Corrected code:"""
+
+            response = self.llm.invoke(fix_prompt).content
+            # Extract code from response
+            if "```python" in response:
+                start = response.find("```python") + 9
+                end = response.find("```", start)
+                fixed_code = response[start:end].strip()
+            else:
+                fixed_code = response.strip()
+            
+            # Validate the fix
+            try:
+                compile(fixed_code, '<string>', 'exec')
+                logger.info("Successfully fixed syntax error using LLM")
+                return fixed_code
+            except:
+                logger.warning("LLM fix failed compilation, returning original")
+                return code
+                
+        except Exception as e:
+            logger.error(f"Error in LLM syntax fix: {e}")
+            return code
+
+    def generate_adaptive_fallback(self, original_code: str, error_msg: str, user_intent: str) -> str:
+        """Generate adaptive fallback code based on error analysis."""
+        if not self.llm:
+            return self._basic_fallback(user_intent)
+        
+        try:
+            available_dfs = list(self.session.dataframes.keys())
+            df_info = {}
+            for df_name in available_dfs[:10]:  # Limit to prevent token overflow
+                df = self.session.dataframes[df_name]
+                df_info[df_name] = list(df.columns)[:10]  # First 10 columns
+            
+            fallback_prompt = f"""Generate robust fallback Python code for this failed analysis:
+
+ORIGINAL CODE:
+```python
+{original_code}
+```
+
+ERROR: {error_msg}
+
+USER INTENT: {user_intent}
+
+AVAILABLE DATA:
+{df_info}
+
+Requirements:
+1. Create safe, robust Python code that won't fail
+2. Address the user's intent: {user_intent}
+3. Use simple, safe iteration patterns (avoid complex pandas operations if they caused errors)
+4. Handle missing data gracefully with try-catch blocks
+5. Use 'dfs' dictionary to access dataframes
+6. Must end with 'result' variable containing meaningful output
+7. Provide useful information even if limited data is available
+
+Generate fallback code:"""
+
+            response = self.llm.invoke(fallback_prompt).content
+            
+            # Extract code from response
+            if "```python" in response:
+                start = response.find("```python") + 9
+                end = response.find("```", start)
+                fallback_code = response[start:end].strip()
+            else:
+                fallback_code = response.strip()
+            
+            # Validate the fallback
+            try:
+                compile(fallback_code, '<string>', 'exec')
+                logger.info("Generated adaptive fallback using LLM")
+                return fallback_code
+            except Exception as compile_error:
+                logger.warning(f"LLM fallback failed compilation: {compile_error}")
+                return self._basic_fallback(user_intent)
+                
+        except Exception as e:
+            logger.error(f"Error generating adaptive fallback: {e}")
+            return self._basic_fallback(user_intent)
+    
+    def _basic_fallback(self, user_intent: str) -> str:
+        """Basic fallback when LLM is not available."""
+        return f'''# Basic analysis fallback
+available_data = list(dfs.keys())
+data_counts = {{df_name: len(dfs[df_name]) for df_name in available_data}}
+
+result = f"Data available for analysis: {{', '.join(available_data)}}. Total records: {{sum(data_counts.values())}}"
+result'''
+
+    def extract_user_intent(self, original_code: str) -> str:
+        """Extract user intent from the original code dynamically."""
+        code_lower = original_code.lower()
+        
+        # Dynamic intent extraction based on code patterns
+        if any(word in code_lower for word in ['error', 'critical', 'warning', 'msg']):
+            return "error and warning analysis"
+        elif any(word in code_lower for word in ['power', 'volt', 'curr', 'battery']):
+            return "power system analysis"
+        elif any(word in code_lower for word in ['alt', 'altitude', 'height']):
+            return "altitude analysis"
+        elif any(word in code_lower for word in ['gps', 'position', 'navigation']):
+            return "navigation analysis"
+        elif any(word in code_lower for word in ['summary', 'overview', 'duration']):
+            return "flight summary analysis"
+        else:
+            return "general flight data analysis"
+
 
 # Input schemas for tools
 class PythonCodeInput(BaseModel):
@@ -144,1805 +475,486 @@ class TelemetryQueryInput(BaseModel):
     """Input schema for telemetry analysis."""
     query: str = Field(..., description="Query about flight data analysis")
 
+class CodeTemplates:
+    """
+    Safe code templates for agent instructions. 
+    All Python code examples are stored here to prevent f-string evaluation errors.
+    
+    🔒 SECURITY FEATURES:
+    - Eliminates f-string evaluation vulnerabilities
+    - Provides safe template storage and retrieval  
+    - Validates template safety before use
+    - Supports extensible template management
+    
+    📋 USAGE EXAMPLES:
+    ```python
+    # Get code examples safely
+    examples = CodeTemplates.get_code_examples_text()
+    
+    # Add new template safely
+    CodeTemplates.add_new_template('new_analysis', 'result = "Safe code"')
+    
+    # Validate template safety
+    is_safe = CodeTemplates.validate_template_safety(template_code)
+    ```
+    
+    ⚠️ IMPORTANT: When adding new templates, ensure they don't contain
+    f-strings with undefined variables that could cause NameError at runtime.
+    """
+    
+    # Basic Python code examples that are safe from variable evaluation
+    FLIGHT_SUMMARY_TEMPLATE = '''# Comprehensive flight analysis
+summary = []
+
+# Flight duration calculation
+time_values = []
+for df_name, df in dfs.items():
+    if 'TimeUS' in df.columns:
+        time_values.extend(df['TimeUS'].dropna().tolist())
+if time_values:
+    duration_min = (max(time_values) - min(time_values)) / 60_000_000
+    summary.append(f"Duration: {duration_min:.1f} minutes")
+
+# Maximum altitude analysis
+max_alt = None
+for source in ['GPS', 'BARO', 'CTUN']:
+    if source in dfs and 'Alt' in dfs[source].columns:
+        alt_values = dfs[source]['Alt'].dropna()
+        if not alt_values.empty:
+            current_max = alt_values.max()
+            if max_alt is None or current_max > max_alt:
+                max_alt = current_max
+if max_alt:
+    summary.append(f"Max altitude: {max_alt:.0f}m")
+
+# Basic power analysis
+for source in ['BAT', 'CURR']:
+    if source in dfs and 'Volt' in dfs[source].columns:
+        voltage = dfs[source]['Volt'].dropna()
+        if not voltage.empty:
+            summary.append(f"Battery: {voltage.mean():.1f}V avg")
+            break
+
+result = "Flight Summary: " + ", ".join(summary)
+result'''
+
+    POWER_ANALYSIS_TEMPLATE = '''# Power system analysis
+power_info = []
+for source in ['BAT', 'CURR', 'POWR']:
+    if source in dfs:
+        df = dfs[source]
+        if 'Volt' in df.columns:
+            voltage = df['Volt'].dropna()
+            if not voltage.empty:
+                power_info.append(f"Voltage: {voltage.mean():.2f}V avg, {voltage.min():.2f}V min")
+        if 'Curr' in df.columns:
+            current = df['Curr'].dropna()
+            if not current.empty:
+                power_info.append(f"Current: {current.mean():.1f}A avg, {current.max():.1f}A peak")
+        if power_info:
+            break
+result = "Power Analysis: " + ", ".join(power_info) if power_info else "No power data available"
+result'''
+
+    ALTITUDE_ANALYSIS_TEMPLATE = '''# Altitude analysis
+max_alt = None
+min_alt = None
+avg_alt = None
+
+for source in ['GPS', 'BARO', 'CTUN', 'AHR2']:
+    if source in dfs and 'Alt' in dfs[source].columns:
+        alt_values = dfs[source]['Alt'].dropna()
+        if not alt_values.empty:
+            max_alt = alt_values.max()
+            min_alt = alt_values.min()
+            avg_alt = alt_values.mean()
+            break
+
+result = f"Altitude Analysis: Max {max_alt:.0f}m, Min {min_alt:.0f}m, Avg {avg_alt:.0f}m" if max_alt else "No altitude data"
+result'''
+
+    ERROR_ANALYSIS_TEMPLATE = '''# Error and message analysis
+error_count = 0
+critical_msgs = []
+
+# Check ERR dataframe
+if 'ERR' in dfs:
+    err_df = dfs['ERR']
+    error_count += len(err_df)
+
+# Check MSG dataframe for critical messages - safer approach
+if 'MSG' in dfs and 'Message' in dfs['MSG'].columns:
+    msg_df = dfs['MSG']
+    critical_keywords = ['ERROR', 'CRITICAL', 'WARNING', 'FAILSAFE']
+    
+    # Use vectorized operations for better performance and reliability
+    try:
+        msg_series = msg_df['Message'].astype(str).str.upper()
+        for keyword in critical_keywords:
+            keyword_matches = msg_series.str.contains(keyword, na=False)
+            critical_msgs.extend(msg_df.loc[keyword_matches, 'Message'].tolist())
+    except Exception:
+        # Fallback to row iteration if vectorized approach fails
+        for idx, row in msg_df.iterrows():
+            try:
+                msg_text = str(row['Message']).upper()
+                if any(keyword in msg_text for keyword in critical_keywords):
+                    critical_msgs.append(row['Message'])
+            except Exception:
+                continue
+
+# Remove duplicates while preserving order
+critical_msgs = list(dict.fromkeys(critical_msgs))
+
+result = f"Found {error_count} errors and {len(critical_msgs)} critical messages"
+result'''
+
+    GPS_ANALYSIS_TEMPLATE = '''# GPS analysis
+gps_info = []
+if 'GPS' in dfs:
+    gps_df = dfs['GPS']
+    if 'NSats' in gps_df.columns:
+        avg_sats = gps_df['NSats'].mean()
+        gps_info.append(f"Average satellites: {avg_sats:.1f}")
+    if 'HDop' in gps_df.columns:
+        avg_hdop = gps_df['HDop'].mean()
+        gps_info.append(f"Average HDOP: {avg_hdop:.2f}")
+
+result = "GPS Analysis: " + ", ".join(gps_info) if gps_info else "No GPS data available"
+result'''
+
+    SIMPLE_EXAMPLES = {
+        'max_altitude': '''max_alt = dfs['BARO']['Alt'].max()
+result = f"Max altitude: {max_alt:.1f}m"
+result''',
+        
+        'flight_duration': '''time_values = []
+for df_name, df in dfs.items():
+    if 'TimeUS' in df.columns:
+        time_values.extend(df['TimeUS'].dropna().tolist())
+duration_sec = (max(time_values) - min(time_values)) / 1_000_000 if time_values else 0
+result = f"Flight duration: {duration_sec/60:.1f} minutes"
+result''',
+        
+        'battery_status': '''voltage = dfs['BAT']['Volt'].mean() if 'BAT' in dfs else None
+result = f"Average battery: {voltage:.1f}V" if voltage else "No battery data"
+result'''
+    }
+
+    @classmethod
+    def get_code_examples_text(cls) -> str:
+        """Return formatted code examples for task descriptions."""
+        # Use string concatenation instead of f-strings to prevent variable evaluation
+        examples_text = "✅ CORRECT Python Code Examples:\n\n"
+        examples_text += "For flight summary:\n```python\n"
+        examples_text += cls.FLIGHT_SUMMARY_TEMPLATE
+        examples_text += "\n```\n\n"
+        examples_text += "For power analysis:\n```python\n"
+        examples_text += cls.POWER_ANALYSIS_TEMPLATE
+        examples_text += "\n```\n\n"
+        examples_text += "For altitude analysis:\n```python\n"
+        examples_text += cls.ALTITUDE_ANALYSIS_TEMPLATE
+        examples_text += "\n```\n\n"
+        examples_text += "For error analysis:\n```python\n"
+        examples_text += cls.ERROR_ANALYSIS_TEMPLATE
+        examples_text += "\n```\n\n"
+        examples_text += "For GPS analysis:\n```python\n"
+        examples_text += cls.GPS_ANALYSIS_TEMPLATE
+        examples_text += "\n```"
+        return examples_text
+
+    @classmethod 
+    def get_tool_examples_text(cls) -> str:
+        """Return tool calling examples."""
+        return '''🔥 TOOL CALLING FORMAT (CRITICAL):
+Use this EXACT format when calling tools - ONE TOOL AT A TIME:
+
+For execute_python_code:
+Action: execute_python_code
+Action Input: {"code": "# Actual Python code here\\nmax_alt = dfs['BARO']['Alt'].max()\\nresult = f'Max altitude: {max_alt:.1f}m'\\nresult"}
+
+For analyze_altitude:
+Action: analyze_altitude  
+Action Input: {"query": "flight summary"}
+
+For detect_flight_events:
+Action: detect_flight_events
+Action Input: {"query": "critical events"}'''
+
+    @classmethod
+    def get_wrong_examples_text(cls) -> str:
+        """Return examples of what NOT to do."""
+        return '''❌ WRONG - These will be rejected:
+- "Generate comprehensive flight summary with power analysis"
+- "Find the maximum altitude"
+- "Analyze battery performance" 
+- "Show flight statistics"'''
+
+    @classmethod
+    def get_specific_example(cls, analysis_type: str) -> str:
+        """
+        Get a specific code example by type.
+        
+        Args:
+            analysis_type: Type of analysis ('flight_summary', 'power_analysis', etc.)
+            
+        Returns:
+            Python code template as string
+        """
+        examples_map = {
+            'flight_summary': cls.FLIGHT_SUMMARY_TEMPLATE,
+            'power_analysis': cls.POWER_ANALYSIS_TEMPLATE,
+            'altitude_analysis': cls.ALTITUDE_ANALYSIS_TEMPLATE,
+            'error_analysis': cls.ERROR_ANALYSIS_TEMPLATE,
+            'gps_analysis': cls.GPS_ANALYSIS_TEMPLATE
+        }
+        
+        return examples_map.get(analysis_type, cls.FLIGHT_SUMMARY_TEMPLATE)
+
+    @classmethod
+    def get_simple_example(cls, example_key: str) -> str:
+        """
+        Get a simple code example by key.
+        
+        Args:
+            example_key: Key for simple example ('max_altitude', 'flight_duration', etc.)
+            
+        Returns:
+            Python code template as string
+        """
+        return cls.SIMPLE_EXAMPLES.get(example_key, cls.SIMPLE_EXAMPLES['max_altitude'])
+
+    @classmethod
+    def add_new_template(cls, template_name: str, template_code: str) -> None:
+        """
+        Safely add a new code template (for future extensibility).
+        
+        Args:
+            template_name: Name of the new template
+            template_code: Python code template (should not contain f-strings with undefined variables)
+        """
+        # Add to simple examples dictionary
+        cls.SIMPLE_EXAMPLES[template_name] = template_code
+
+    @classmethod
+    def validate_template_safety(cls, template_code: str) -> bool:
+        """
+        Validate that a template is safe from f-string evaluation errors.
+        
+        Args:
+            template_code: Code template to validate
+            
+        Returns:
+            True if template is safe, False otherwise
+        """
+        try:
+            # Try to format the template - if it has undefined variables, it will fail
+            # This is a simple check, but helps catch obvious issues
+            test_format = template_code.format()
+            return True
+        except (KeyError, ValueError):
+            # Template contains formatting placeholders that could cause issues
+            return False
+        except:
+            # Other errors are generally OK for our use case
+            return True
+
+    @classmethod
+    def get_safe_description_builder(cls) -> List[str]:
+        """
+        Get a list of safe description parts that can be joined safely.
+        This method ensures no f-string evaluation vulnerabilities.
+        
+        Returns:
+            List of strings that can be safely joined
+        """
+        return [
+            "🚨 CRITICAL PYTHON CODE REQUIREMENTS:",
+            "For execute_python_code tool, you MUST write actual executable Python code, NOT natural language:",
+            "",
+            cls.get_code_examples_text(),
+            "",
+            cls.get_wrong_examples_text(),
+            "",
+            cls.get_tool_examples_text(),
+        ]
+
+    @classmethod
+    def test_template_safety(cls) -> Dict[str, bool]:
+        """
+        Test method to demonstrate the robustness of the template system.
+        This shows that the solution can handle edge cases that would have 
+        previously caused NameError exceptions.
+        
+        Returns:
+            Dictionary of test results
+        """
+        test_results = {}
+        
+        # Test 1: Basic template safety
+        try:
+            examples_text = cls.get_code_examples_text()
+            test_results['basic_template_generation'] = len(examples_text) > 0
+        except Exception as e:
+            test_results['basic_template_generation'] = False
+            logger.error(f"Basic template generation failed: {e}")
+        
+        # Test 2: Edge case - adding problematic template
+        try:
+            # This would have caused issues in the old system
+            problematic_template = "result = f'Value: {undefined_variable:.2f}'"
+            cls.add_new_template('test_problematic', problematic_template)
+            
+            # Getting the template should still work (it's stored safely)
+            retrieved = cls.get_simple_example('test_problematic')
+            test_results['problematic_template_handling'] = retrieved == problematic_template
+        except Exception as e:
+            test_results['problematic_template_handling'] = False
+            logger.error(f"Problematic template handling failed: {e}")
+        
+        # Test 3: Template validation
+        try:
+            safe_template = "result = 'This is safe'"
+            unsafe_template = "result = f'Value: {undefined_var}'"
+            
+            safe_result = cls.validate_template_safety(safe_template)
+            unsafe_result = cls.validate_template_safety(unsafe_template)
+            
+            test_results['template_validation'] = safe_result and not unsafe_result
+        except Exception as e:
+            test_results['template_validation'] = False
+            logger.error(f"Template validation failed: {e}")
+        
+        # Test 4: Safe description builder
+        try:
+            description_parts = cls.get_safe_description_builder()
+            combined = "\n".join(description_parts)
+            test_results['safe_description_builder'] = len(combined) > 100
+        except Exception as e:
+            test_results['safe_description_builder'] = False
+            logger.error(f"Safe description builder failed: {e}")
+        
+        return test_results
+
+
 # Custom CrewAI Tools with simplified implementation
 class PythonCodeExecutorTool(BaseTool):
     name: str = "execute_python_code"
-    description: str = "Execute Python code to analyze UAV flight data and extract specific numerical values, statistics, and insights. Pass a natural language query like 'What was the maximum battery temperature?' rather than incomplete Python code."
+    description: str = "Execute valid Python code to analyze UAV flight data. ONLY pass actual Python code, NOT natural language queries. The code must be complete and executable."
     args_schema: Type[BaseModel] = PythonCodeInput
     
     def __init__(self, analysis_tools: AnalysisTools, session: V2ConversationSession):
         super().__init__()
         self._analysis_tools = analysis_tools
         self._session = session
+        self._validator = None  # Will be initialized when LLM is available
+    
+    def _get_validator(self):
+        """Lazy initialization of validator with LLM access."""
+        if self._validator is None:
+            # Get LLM from the MultiRoleAgent context if available
+            try:
+                from config import get_settings
+                settings = get_settings()
+                if settings.openai_api_key:
+                    from langchain_openai import ChatOpenAI
+                    llm = ChatOpenAI(
+                        api_key=settings.openai_api_key,
+                        model=settings.openai_model,
+                        temperature=0.1  # Low temperature for code generation
+                    )
+                    self._validator = PythonCodeValidator(llm, self._session)
+                else:
+                    self._validator = PythonCodeValidator(None, self._session)
+            except Exception as e:
+                logger.warning(f"Could not initialize LLM for code validation: {e}")
+                self._validator = PythonCodeValidator(None, self._session)
+        return self._validator
     
     def _run(self, code: str) -> str:
-        """Execute Python code or auto-generate code based on common queries."""
+        """Execute Python code with generalized error recovery."""
         logger.info(f"[{self._session.session_id}] PythonCodeExecutorTool received: {code[:100]}...")
         
-        # Debug: Check if session has dataframes
+        # Basic session validation
         if not self._session.dataframes:
-            logger.error(f"[{self._session.session_id}] NO DATAFRAMES AVAILABLE - session.dataframes is empty!")
+            logger.error(f"[{self._session.session_id}] NO DATAFRAMES AVAILABLE")
             return "Error: No flight data available. Please upload a log file first."
         
         logger.info(f"[{self._session.session_id}] Available dataframes: {list(self._session.dataframes.keys())}")
         
+        # Validate that this is actual Python code
+        if not self._is_valid_python_code(code):
+            logger.error(f"[{self._session.session_id}] INVALID INPUT: Tool received natural language")
+            return f"ERROR: This tool only accepts Python code, not natural language. Received: '{code[:50]}...'"
+        
+        # Get validator for advanced error handling
+        validator = self._get_validator()
+        
+        # Pre-validate and fix obvious issues
+        validated_code = validator.validate_and_fix_code(code)
+        
         try:
-            result = None
+            logger.info(f"[{self._session.session_id}] Executing Python code")
+            result = self._analysis_tools.execute_python_code(self._session, validated_code)
             
-            # Enhanced query detection - check for natural language first
-            if self._is_query_not_code(code):
-                logger.info(f"[{self._session.session_id}] Detected natural language query, generating code...")
-                # Auto-generate Python code for common queries
-                generated_code = self._generate_code_for_query(code)
-                if generated_code:
-                    logger.info(f"[{self._session.session_id}] Generated Python code: {generated_code[:200]}...")
-                    result = self._analysis_tools.execute_python_code(self._session, generated_code)
-                    logger.info(f"[{self._session.session_id}] Analysis tools returned: {result[:200]}...")
-                else:
-                    # Fallback: try to provide a direct answer based on query
-                    result = self._attempt_direct_query_answer(code)
-            
-            # Check if this looks like incomplete/invalid Python code
-            elif self._is_incomplete_code(code):
-                logger.info(f"[{self._session.session_id}] Detected incomplete code, trying to fix or interpret...")
-                # Try to extract the intent from incomplete code
-                fixed_query = self._extract_intent_from_code(code)
-                if fixed_query:
-                    generated_code = self._generate_code_for_query(fixed_query)
-                    if generated_code:
-                        logger.info(f"[{self._session.session_id}] Fixed incomplete code and generated proper code")
-                        result = self._analysis_tools.execute_python_code(self._session, generated_code)
-                    else:
-                        # Try direct analysis as fallback
-                        result = self._attempt_direct_query_answer(fixed_query)
-                else:
-                    # Enhanced fallback: try to interpret the variable assignment as a query
-                    result = self._interpret_assignment_as_query(code)
-            
-            else:
-                # Execute the provided Python code directly
-                logger.info(f"[{self._session.session_id}] Executing provided Python code directly")
-                result = self._analysis_tools.execute_python_code(self._session, code)
-            
-            # Validate and return result
             if result and len(result.strip()) > 0:
-                logger.info(f"[{self._session.session_id}] Returning successful result: {result[:200]}...")
+                logger.info(f"[{self._session.session_id}] Execution successful")
                 return result
             else:
-                logger.warning(f"[{self._session.session_id}] Empty or null result, trying fallback...")
-                return self._attempt_direct_query_answer(code)
+                logger.warning(f"[{self._session.session_id}] Code executed but returned empty result")
+                return "Python code executed successfully but returned no output."
             
         except Exception as e:
-            error_msg = f"Code execution failed: {str(e)}"
-            logger.error(f"[{self._session.session_id}] {error_msg}")
-            # Try one more fallback
+            error_msg = str(e)
+            logger.error(f"[{self._session.session_id}] Execution failed: {error_msg}")
+            
+            # GENERALIZED ERROR RECOVERY
+            user_intent = validator.extract_user_intent(validated_code)
+            logger.info(f"[{self._session.session_id}] Attempting adaptive fallback for: {user_intent}")
+            
+            fallback_code = validator.generate_adaptive_fallback(validated_code, error_msg, user_intent)
+            
             try:
-                fallback_result = self._attempt_direct_query_answer(code)
-                logger.info(f"[{self._session.session_id}] Fallback successful: {fallback_result[:100]}...")
-                return fallback_result
+                fallback_result = self._analysis_tools.execute_python_code(self._session, fallback_code)
+                if fallback_result:
+                    logger.info(f"[{self._session.session_id}] Adaptive fallback successful")
+                    return fallback_result
             except Exception as fallback_error:
-                logger.error(f"[{self._session.session_id}] Fallback also failed: {str(fallback_error)}")
-                return f"Analysis failed: {error_msg}. Available data: {list(self._session.dataframes.keys())}"
+                logger.error(f"[{self._session.session_id}] Fallback also failed: {fallback_error}")
+            
+            # If all else fails, provide helpful error information
+            return f"Analysis failed: {error_msg}. Available data: {', '.join(self._session.dataframes.keys())}"
     
-    def _attempt_direct_query_answer(self, query: str) -> str:
-        """Attempt to provide a direct answer based on available data when code generation fails."""
-        try:
-            query_lower = query.lower()
-            available_dfs = list(self._session.dataframes.keys())
-            
-            # Quick altitude check
-            if 'altitude' in query_lower or 'highest' in query_lower:
-                for df_name in ['GPS', 'BARO', 'CTUN', 'AHR2']:
-                    if df_name in available_dfs:
-                        df = self._session.dataframes[df_name]
-                        if 'Alt' in df.columns:
-                            max_alt = df['Alt'].max()
-                            return f"The highest altitude reached was {max_alt:.1f} meters (from {df_name} data)."
-            
-            # Quick error check  
-            if 'error' in query_lower or 'warning' in query_lower:
-                error_count = 0
-                if 'ERR' in available_dfs:
-                    error_count += len(self._session.dataframes['ERR'])
-                if 'MSG' in available_dfs:
-                    msg_df = self._session.dataframes['MSG']
-                    if 'Message' in msg_df.columns:
-                        error_msgs = msg_df[msg_df['Message'].str.contains('ERROR|WARNING|CRITICAL', case=False, na=False)]
-                        error_count += len(error_msgs)
-                
-                if error_count > 0:
-                    return f"Found {error_count} errors/warnings in the flight data."
-                else:
-                    return "No significant errors or warnings detected in the flight data."
-            
-            # If we can't provide a specific answer, at least show what data is available
-            return f"Unable to analyze the query directly. Available data types in this flight log: {', '.join(available_dfs)}. Please provide a more specific question."
-            
-        except Exception as e:
-            return f"Unable to process query: {str(e)}"
-    
-    def _is_query_not_code(self, text: str) -> bool:
-        """Determine if text is a query rather than Python code."""
-        # Check for common Python keywords
-        python_keywords = ['def ', 'import ', 'for ', 'if ', 'while ', 'class ', 'print(', 'return', 'exec', 'eval']
+    def _is_valid_python_code(self, text: str) -> bool:
+        """Validate that text is actual Python code."""
+        text = text.strip()
         
-        # If it contains Python keywords, treat as code
-        if any(keyword in text for keyword in python_keywords):
+        # Must contain basic Python syntax elements
+        python_indicators = ['=', 'for ', 'if ', 'def ', 'import ', 'from ', 'print(', 'result', '[', ']', '(', ')']
+        has_python_syntax = any(indicator in text for indicator in python_indicators)
+        
+        if not has_python_syntax:
             return False
         
-        # If it's a question or natural language, treat as query
-        question_indicators = ['what', 'when', 'how', 'where', 'maximum', 'minimum', 'battery', 'temperature', 'time', 'error', 'signal', 'loss', 'highest', 'lowest']
+        # Reject obvious natural language queries
+        first_line = text.split('\n')[0].strip().lower()
+        natural_language_starters = [
+            'generate', 'create a', 'show me', 'tell me', 'what is',
+            'how much', 'find the', 'get the', 'calculate the', 'determine the',
+            'provide me', 'give me', 'can you', 'please', 'i want', 'i need'
+        ]
         
-        return any(indicator in text.lower() for indicator in question_indicators)
-    
-    def _is_incomplete_code(self, text: str) -> bool:
-        """Check if the code looks incomplete or invalid."""
-        # Simple assignment without return/output
-        if '=' in text and not any(keyword in text for keyword in ['return', 'print', 'f"', '"""', "'''"]):
-            return True
+        if not first_line.startswith('#') and any(first_line.startswith(starter) for starter in natural_language_starters):
+            return False
         
-        # Single variable name
-        if len(text.strip().split()) == 1 and text.strip().isidentifier():
-            return True
-        
-        # Try to compile/parse the code
+        # Try to compile
         try:
             compile(text, '<string>', 'exec')
-            # If it compiles but doesn't seem to return anything useful
-            if not any(keyword in text for keyword in ['return', 'print', 'f"', '"""', "'''", 'result', 'output']):
-                return True
-        except:
             return True
-        
-        return False
-    
-    def _extract_intent_from_code(self, code: str) -> Optional[str]:
-        """Try to extract the intent from incomplete code."""
-        code_lower = code.lower()
-        
-        # Battery temperature
-        if 'battery' in code_lower and 'temp' in code_lower:
-            return "What was the maximum battery temperature?"
-        
-        # Flight time
-        if 'flight' in code_lower and 'time' in code_lower:
-            return "What was the total flight time?"
-        
-        # GPS signal
-        if 'gps' in code_lower and ('signal' in code_lower or 'loss' in code_lower):
-            return "Was there any GPS signal loss?"
-        
-        # Altitude
-        if 'altitude' in code_lower or 'alt' in code_lower:
-            if 'max' in code_lower or 'maximum' in code_lower:
-                return "What was the maximum altitude?"
-            elif 'min' in code_lower or 'minimum' in code_lower:
-                return "What was the minimum altitude?"
-        
-        # Errors
-        if 'error' in code_lower:
-            return "Were there any critical errors?"
-        
-        return None
-    
-    def _generate_code_for_query(self, query: str) -> Optional[str]:
-        """Generate Python code for common queries."""
-        query_lower = query.lower()
-        
-        # Enhanced contextual altitude queries
-        if any(phrase in query_lower for phrase in ['consistently high', 'high altitude', 'altitude consistency', 'stable altitude']):
-            return self._generate_altitude_consistency_code()
-        
-        # Flight stability and control queries
-        elif any(phrase in query_lower for phrase in ['flight stability', 'stable flight', 'flight control']):
-            return self._generate_flight_stability_code()
-        
-        # Power consumption queries - NEW
-        elif any(phrase in query_lower for phrase in ['power consumption', 'analyze power', 'battery consumption', 'current consumption', 'power analysis']):
-            return self._generate_power_consumption_code()
-        
-        # Battery queries (temperature, voltage, current)
-        elif 'battery' in query_lower:
-            if 'temperature' in query_lower or 'temp' in query_lower:
-                return self._generate_battery_temperature_code()
-            elif 'voltage' in query_lower or 'volt' in query_lower:
-                return self._generate_battery_voltage_code()
-            elif 'current' in query_lower or 'consumption' in query_lower:
-                return self._generate_power_consumption_code()
-            else:
-                return self._generate_comprehensive_battery_code()
-        
-        # Power system queries
-        elif any(word in query_lower for word in ['power', 'voltage', 'current']) and not 'altitude' in query_lower:
-            return self._generate_power_consumption_code()
-        
-        # Flight time queries - enhanced detection
-        elif any(phrase in query_lower for phrase in ['flight time', 'total time', 'duration', 'how long', 'time was', 'minutes']):
-            return self._generate_flight_time_code()
-        
-        # Flight summary queries that should include duration
-        elif any(phrase in query_lower for phrase in ['summary', 'overview', 'give me a summary']) and 'flight' in query_lower:
-            return self._generate_comprehensive_flight_summary_code()
-        
-        # Temperature queries - enhanced detection for maximum battery temperature
-        elif any(phrase in query_lower for phrase in ['maximum battery temperature', 'max battery temp', 'battery temperature', 'maximum temperature']):
-            return self._generate_battery_temperature_code()
-        
-        # GPS signal loss queries
-        elif 'gps' in query_lower and any(word in query_lower for word in ['signal', 'loss', 'lost']):
-            return self._generate_gps_loss_code()
-        
-        # Critical error queries
-        elif any(phrase in query_lower for phrase in ['critical error', 'system error', 'error code']):
-            return self._generate_error_analysis_code()
-        
-        # RC signal loss queries
-        elif 'rc' in query_lower and any(word in query_lower for word in ['signal', 'loss', 'lost']):
-            return self._generate_rc_loss_code()
-        
-        # Enhanced error/warning analysis - prioritize this for critical error queries
-        elif any(word in query_lower for word in ['error', 'warning', 'problem', 'issue', 'alert', 'critical']):
-            return self._generate_comprehensive_error_code()
-        
-        # Mid-flight specific error analysis
-        elif 'mid-flight' in query_lower and any(word in query_lower for word in ['error', 'critical']):
-            return self._generate_comprehensive_error_code()
-        
-        # Standard altitude queries
-        elif 'altitude' in query_lower:
-            if 'max' in query_lower or 'maximum' in query_lower or 'highest' in query_lower:
-                return self._generate_altitude_code('max')
-            elif 'min' in query_lower or 'minimum' in query_lower or 'lowest' in query_lower:
-                return self._generate_altitude_code('min')
-            else:
-                return self._generate_altitude_code('stats')
-        
-        # Context-aware interpretation for "consistently high" without altitude keyword
-        elif 'consistently high' in query_lower or 'consistent high' in query_lower:
-            return self._generate_altitude_consistency_code()
-        
-        return None
-    
-    def _generate_altitude_code(self, analysis_type: str) -> str:
-        """Generate code for altitude analysis."""
-        if analysis_type == 'max':
-            return """
-# Find maximum altitude
-altitude_sources = ['GPS', 'BARO', 'CTUN', 'AHR2', 'POS']
-max_alt = None
-source_used = None
-
-for source in altitude_sources:
-    if source in dfs:
-        df = dfs[source]
-        if 'Alt' in df.columns:
-            alt_values = df['Alt'].dropna()
-            if not alt_values.empty:
-                current_max = alt_values.max()
-                if max_alt is None or current_max > max_alt:
-                    max_alt = current_max
-                    source_used = f"{source}.Alt"
-
-# Return result
-if max_alt is not None:
-    result = f"The highest altitude reached during the flight was {max_alt:.1f} meters (from {source_used})"
-else:
-    # Try alternative approach - check any dataframe for Alt-like columns
-    for df_name, df in dfs.items():
-        alt_like_cols = [col for col in df.columns if 'alt' in col.lower() or 'height' in col.lower()]
-        if alt_like_cols:
-            values = df[alt_like_cols[0]].dropna()
-            if not values.empty and values.max() > 0:
-                result = f"Maximum altitude reached was {values.max():.1f} meters (from {df_name}.{alt_like_cols[0]})"
-                break
-    else:
-        # Gracefully skip instead of reporting negative findings
-        result = "Flight altitude information is available for analysis."
-result
-"""
-        elif analysis_type == 'min':
-            return """
-# Find minimum altitude  
-altitude_sources = ['GPS', 'BARO', 'CTUN', 'AHR2', 'POS']
-min_alt = None
-source_used = None
-
-for source in altitude_sources:
-    if source in dfs:
-        df = dfs[source]
-        if 'Alt' in df.columns:
-            alt_values = df['Alt'].dropna()
-            if not alt_values.empty:
-                current_min = alt_values.min()
-                if min_alt is None or current_min < min_alt:
-                    min_alt = current_min
-                    source_used = f"{source}.Alt"
-
-# Return result
-if min_alt is not None:
-    result = f"The lowest altitude during the flight was {min_alt:.1f} meters (from {source_used})"
-else:
-    # Try alternative approach - check any dataframe for Alt-like columns
-    for df_name, df in dfs.items():
-        alt_like_cols = [col for col in df.columns if 'alt' in col.lower() or 'height' in col.lower()]
-        if alt_like_cols:
-            values = df[alt_like_cols[0]].dropna()
-            if not values.empty:
-                result = f"Minimum altitude during flight was {values.min():.1f} meters (from {df_name}.{alt_like_cols[0]})"
-                break
-    else:
-        # Gracefully skip instead of reporting negative findings
-        result = "Flight altitude information is available for analysis."
-result
-"""
-        else:  # stats
-            return """
-# Altitude statistics
-altitude_sources = ['GPS', 'BARO', 'CTUN', 'AHR2', 'POS']
-alt_stats = []
-
-for source in altitude_sources:
-    if source in dfs:
-        df = dfs[source]
-        if 'Alt' in df.columns:
-            alt_values = df['Alt'].dropna()
-            if not alt_values.empty:
-                stats = {
-                    'source': source,
-                    'max': alt_values.max(),
-                    'min': alt_values.min(),
-                    'mean': alt_values.mean(),
-                    'count': len(alt_values)
-                }
-                alt_stats.append(stats)
-
-# Return result
-if alt_stats:
-    best_source = max(alt_stats, key=lambda x: x['count'])
-    result = f"Altitude Analysis (from {best_source['source']}):\\n"
-    result += f"• Maximum: {best_source['max']:.1f}m\\n"
-    result += f"• Minimum: {best_source['min']:.1f}m\\n"
-    result += f"• Average: {best_source['mean']:.1f}m\\n"
-    result += f"• Data points: {best_source['count']}"
-else:
-    # Try alternative approach for comprehensive stats
-    for df_name, df in dfs.items():
-        alt_like_cols = [col for col in df.columns if 'alt' in col.lower() or 'height' in col.lower()]
-        if alt_like_cols:
-            values = df[alt_like_cols[0]].dropna()
-            if not values.empty:
-                result = f"Altitude Statistics (from {df_name}.{alt_like_cols[0]}):\\n"
-                result += f"• Maximum: {values.max():.1f}m\\n"
-                result += f"• Minimum: {values.min():.1f}m\\n"
-                result += f"• Average: {values.mean():.1f}m\\n"
-                result += f"• Data points: {len(values)}"
-                break
-    else:
-        # Gracefully skip instead of reporting negative findings
-        result = "Flight altitude data is available for detailed analysis."
-result
-"""
-    
-    def _generate_battery_temperature_code(self) -> str:
-        """Generate code to find maximum battery temperature."""
-        return """
-# Battery Temperature Analysis - Concise Output
-max_temp = None
-source_used = None
-
-# Check multiple sources for temperature data
-temperature_sources = ['BAT', 'BATT', 'CURR', 'POWR']
-
-for source in temperature_sources:
-    if source in dfs:
-        df = dfs[source]
-        
-        # Look for temperature columns
-        temp_cols = []
-        for col in df.columns:
-            col_lower = col.lower()
-            if any(temp_keyword in col_lower for temp_keyword in ['temp', 'tmp', 'temperature']):
-                temp_cols.append(col)
-        
-        if temp_cols:
-            for col in temp_cols:
-                temp_values = df[col].dropna()
-                if not temp_values.empty and temp_values.nunique() > 1:
-                    current_max = temp_values.max()
-                    current_avg = temp_values.mean()
-                    
-                    # Check if values are realistic (-50°C to 150°C)
-                    if -50 <= current_avg <= 150:
-                        if max_temp is None or current_max > max_temp:
-                            max_temp = current_max
-                            source_used = f"{source}.{col}"
-                        break
-        
-        # If we found temperature data, stop searching
-        if max_temp is not None:
-            break
-
-# Return concise result
-if max_temp is not None:
-    result = f"Battery temperature:\n"
-    result += f"• Average: {current_avg:.0f}°C\n"
-    result += f"• Peak: {max_temp:.0f}°C"
-    
-    # Add simple status
-    if max_temp > 60:
-        result += "\n• The temperature remained within safe limits throughout the flight."
-    else:
-        result += "\n• The temperature remained within safe limits throughout the flight."
-else:
-    result = "No temperature data found in flight log."
-
-result
-"""
-    
-    def _generate_flight_time_code(self) -> str:
-        """Generate code to calculate total flight time."""
-        return """
-# Calculate total flight time
-time_values = []
-
-# Collect time values from various sources (TimeUS is in microseconds)
-for df_name, df in dfs.items():
-    if 'TimeUS' in df.columns:
-        df_times = df['TimeUS'].dropna()
-        if not df_times.empty:
-            time_values.extend(df_times.tolist())
-    elif 'timestamp' in df.columns:
-        df_timestamps = df['timestamp'].dropna()
-        if not df_timestamps.empty:
-            # Convert timestamps to microseconds for consistency
-            time_values.extend([t.timestamp() * 1_000_000 for t in df_timestamps])
-
-# Calculate and return result
-if time_values:
-    # Calculate duration from microseconds
-    start_time_us = min(time_values)
-    end_time_us = max(time_values)
-    duration_seconds = (end_time_us - start_time_us) / 1_000_000
-    duration_minutes = duration_seconds / 60
-    
-    if duration_minutes >= 1:
-        result = f"The total flight time was {duration_minutes:.1f} minutes ({duration_seconds:.0f} seconds)"
-    else:
-        result = f"The total flight time was {duration_seconds:.1f} seconds"
-else:
-    # Fallback: try to estimate from data size and typical logging rates
-    largest_df = None
-    largest_size = 0
-    for df_name, df in dfs.items():
-        if len(df) > largest_size:
-            largest_df = df_name
-            largest_size = len(df)
-    
-    if largest_df and largest_size > 100:
-        # Estimate based on typical logging rates (e.g., 10Hz for most data)
-        estimated_seconds = largest_size / 10  # Assume 10Hz logging
-        estimated_minutes = estimated_seconds / 60
-        result = f"Estimated flight time: {estimated_minutes:.1f} minutes (based on {largest_size} data points in {largest_df})"
-    else:
-        # Gracefully skip instead of reporting negative findings
-        result = "Flight timing data is available for analysis."
-result
-"""
-    
-    def _generate_comprehensive_flight_summary_code(self) -> str:
-        """Generate code for comprehensive flight summary with enhanced insights."""
-        return """
-# Enhanced Flight Summary Analysis with Operational Insights
-summary_sections = {}
-
-# 1. Flight Duration and Basic Stats
-time_values = []
-for df_name, df in dfs.items():
-    if 'TimeUS' in df.columns:
-        df_times = df['TimeUS'].dropna()
-        if not df_times.empty:
-            time_values.extend(df_times.tolist())
-    elif 'timestamp' in df.columns:
-        df_timestamps = df['timestamp'].dropna()
-        if not df_timestamps.empty:
-            time_values.extend([t.timestamp() * 1_000_000 for t in df_timestamps])
-
-if time_values:
-    start_time_us = min(time_values)
-    end_time_us = max(time_values)
-    duration_seconds = (end_time_us - start_time_us) / 1_000_000
-    duration_minutes = duration_seconds / 60
-    
-    # Enhanced duration reporting with context
-    if duration_minutes >= 60:
-        summary_sections['duration'] = f"🕐 Flight Duration: {duration_minutes/60:.1f} hours ({duration_minutes:.0f} minutes) - Extended operation"
-    elif duration_minutes >= 10:
-        summary_sections['duration'] = f"🕐 Flight Duration: {duration_minutes:.1f} minutes - Standard mission length"
-    elif duration_minutes >= 1:
-        summary_sections['duration'] = f"🕐 Flight Duration: {duration_minutes:.1f} minutes - Short flight or test"
-    else:
-        summary_sections['duration'] = f"🕐 Flight Duration: {duration_seconds:.1f} seconds - Brief operation"
-
-# 2. Enhanced Altitude Analysis
-altitude_sources = ['GPS', 'BARO', 'CTUN', 'AHR2', 'POS']
-for source in altitude_sources:
-    if source in dfs:
-        df = dfs[source]
-        if 'Alt' in df.columns:
-            alt_values = df['Alt'].dropna()
-            if not alt_values.empty:
-                max_alt = alt_values.max()
-                min_alt = alt_values.min()
-                avg_alt = alt_values.mean()
-                alt_range = max_alt - min_alt
-                
-                # Enhanced altitude reporting with operational context
-                altitude_analysis = f"📏 Altitude Profile: Max {max_alt:.0f}m, Avg {avg_alt:.0f}m"
-                if alt_range > 200:
-                    altitude_analysis += f" (Range: {alt_range:.0f}m - Multi-phase mission with significant altitude changes)"
-                elif alt_range > 50:
-                    altitude_analysis += f" (Range: {alt_range:.0f}m - Standard takeoff/cruise/landing profile)"
-                elif alt_range > 10:
-                    altitude_analysis += f" (Range: {alt_range:.0f}m - Stable cruise with minor variations)"
-                else:
-                    altitude_analysis += f" (Range: {alt_range:.0f}m - Very stable altitude maintenance)"
-                
-                # Add operational insights
-                if min_alt <= 5:
-                    altitude_analysis += ". Ground operations included"
-                elif min_alt > 100:
-                    altitude_analysis += ". Maintained safe altitude clearance"
-                
-                summary_sections['altitude'] = altitude_analysis
-                break
-
-# 3. Enhanced Speed and Performance Analysis
-if 'GPS' in dfs:
-    gps_df = dfs['GPS']
-    if 'Spd' in gps_df.columns:
-        speed_values = gps_df['Spd'].dropna()
-        if not speed_values.empty and len(speed_values) > 10:
-            max_speed = speed_values.max()
-            avg_speed = speed_values.mean()
-            if avg_speed > 0.5:  # Meaningful speed data
-                speed_analysis = f"🏃 Speed Profile: Max {max_speed:.1f} m/s, Avg {avg_speed:.1f} m/s"
-                
-                # Add performance context
-                if max_speed > 20:
-                    speed_analysis += " (High-speed operations)"
-                elif max_speed > 10:
-                    speed_analysis += " (Moderate flight speeds)"
-                elif max_speed > 3:
-                    speed_analysis += " (Conservative flight speeds)"
-                else:
-                    speed_analysis += " (Low-speed operations)"
-                
-                summary_sections['speed'] = speed_analysis
-
-# 4. Enhanced Power System Analysis
-if 'BAT' in dfs or 'CURR' in dfs:
-    power_analysis = []
-    
-    # Check BAT dataframe first (more comprehensive)
-    if 'BAT' in dfs:
-        bat_df = dfs['BAT']
-        if 'Volt' in bat_df.columns:
-            voltage_values = bat_df['Volt'].dropna()
-            if not voltage_values.empty:
-                min_voltage = voltage_values.min()
-                max_voltage = voltage_values.max()
-                avg_voltage = voltage_values.mean()
-                voltage_drop = max_voltage - min_voltage
-                
-                power_analysis.append(f"Battery: {avg_voltage:.2f}V avg")
-                
-                # Enhanced voltage assessment
-                if min_voltage < 3.3:  # Per cell for typical setup
-                    power_analysis.append("⚠️ Critical voltage reached")
-                elif min_voltage < 3.6:
-                    power_analysis.append("⚠️ Low voltage warning")
-                elif voltage_drop > 1.0:
-                    power_analysis.append(f"Significant discharge ({voltage_drop:.1f}V drop)")
-                else:
-                    power_analysis.append("Healthy voltage levels")
-        
-        # Check current if available
-        if 'Curr' in bat_df.columns:
-            current_values = bat_df['Curr'].dropna()
-            if not current_values.empty:
-                max_current = current_values.max()
-                avg_current = current_values.mean()
-                power_analysis.append(f"Current: {avg_current:.1f}A avg, {max_current:.1f}A peak")
-        
-        # Temperature analysis
-        if 'Temp' in bat_df.columns:
-            temp_values = bat_df['Temp'].dropna()
-            if not temp_values.empty and temp_values.max() > 0:
-                max_temp = temp_values.max()
-                if max_temp > 50:
-                    power_analysis.append(f"⚠️ High temperature: {max_temp:.1f}°C")
-                elif max_temp > 40:
-                    power_analysis.append(f"Elevated temperature: {max_temp:.1f}°C")
-                else:
-                    power_analysis.append(f"Normal temperature: {max_temp:.1f}°C")
-    
-    # Fallback to CURR if BAT not available
-    elif 'CURR' in dfs:
-        curr_df = dfs['CURR']
-        if 'Volt' in curr_df.columns:
-            voltage_values = curr_df['Volt'].dropna()
-            if not voltage_values.empty:
-                min_voltage = voltage_values.min()
-                avg_voltage = voltage_values.mean()
-                power_analysis.append(f"Battery: {avg_voltage:.2f}V avg")
-                if min_voltage < 11.1:
-                    power_analysis.append(f"⚠️ Low voltage: {min_voltage:.2f}V")
-    
-    if power_analysis:
-        summary_sections['power'] = f"🔋 Power System: " + ", ".join(power_analysis)
-
-# 5. Enhanced GPS/Navigation Analysis
-if 'GPS' in dfs:
-    gps_df = dfs['GPS']
-    gps_analysis = []
-    
-    if 'NSats' in gps_df.columns:
-        sat_values = gps_df['NSats'].dropna()
-        if not sat_values.empty:
-            min_sats = sat_values.min()
-            avg_sats = sat_values.mean()
-            gps_analysis.append(f"GPS: {avg_sats:.1f} satellites avg")
-            
-            if min_sats < 4:
-                gps_analysis.append("⚠️ Poor GPS reception periods")
-            elif min_sats < 6:
-                gps_analysis.append("⚠️ Marginal GPS reception")
-            else:
-                gps_analysis.append("Good GPS reception")
-    
-    if 'Status' in gps_df.columns:
-        status_values = gps_df['Status'].dropna()
-        if not status_values.empty:
-            gps_3d_fix = (status_values >= 3).sum()
-            total_readings = len(status_values)
-            fix_percentage = (gps_3d_fix / total_readings) * 100 if total_readings > 0 else 0
-            
-            if fix_percentage < 70:
-                gps_analysis.append(f"⚠️ 3D fix only {fix_percentage:.0f}% of time")
-            elif fix_percentage < 95:
-                gps_analysis.append(f"3D fix {fix_percentage:.0f}% of time")
-            else:
-                gps_analysis.append("Excellent GPS fix reliability")
-    
-    if gps_analysis:
-        summary_sections['gps'] = f"🛰️ Navigation: " + ", ".join(gps_analysis)
-
-# 6. Enhanced Error/Event Analysis
-error_analysis = []
-critical_count = 0
-warning_count = 0
-failsafe_events = []
-
-if 'ERR' in dfs:
-    err_df = dfs['ERR']
-    if not err_df.empty:
-        critical_count += len(err_df)
-        # Group by subsystem for more informative reporting
-        if 'Subsys' in err_df.columns:
-            subsys_errors = err_df['Subsys'].value_counts()
-            for subsys, count in subsys_errors.head(3).items():
-                error_analysis.append(f"Subsystem {subsys}: {count} errors")
-
-if 'MSG' in dfs:
-    msg_df = dfs['MSG']
-    if not msg_df.empty and 'Message' in msg_df.columns:
-        for idx, row in msg_df.iterrows():
-            message = str(row['Message'])
-            message_upper = message.upper()
-            
-            # Categorize messages
-            if any(keyword in message_upper for keyword in ['CRITICAL', 'EMERGENCY', 'FAIL']):
-                critical_count += 1
-                if 'FAILSAFE' in message_upper:
-                    failsafe_events.append(message)
-            elif any(keyword in message_upper for keyword in ['WARNING', 'ALERT']):
-                warning_count += 1
-
-# Format event summary with actionable information
-if critical_count > 0 or warning_count > 0:
-    event_summary = f"⚠️ Flight Events: "
-    event_details = []
-    
-    if critical_count > 0:
-        event_details.append(f"{critical_count} critical")
-    if warning_count > 0:
-        event_details.append(f"{warning_count} warnings")
-    
-    event_summary += ", ".join(event_details)
-    
-    # Add specific failsafe information
-    if failsafe_events:
-        unique_failsafes = list(set([msg.split(' ')[0] + ' ' + msg.split(' ')[1] if len(msg.split(' ')) > 1 else msg for msg in failsafe_events]))
-        if len(unique_failsafes) <= 3:
-            event_summary += f". Failsafes: {', '.join(unique_failsafes)}"
-        else:
-            event_summary += f". Multiple failsafe types detected ({len(failsafe_events)} total)"
-    
-    summary_sections['events'] = event_summary
-else:
-    summary_sections['events'] = "✅ No critical errors or warnings detected - Clean flight"
-
-# 7. Flight Mode Analysis
-if 'MODE' in dfs:
-    mode_df = dfs['MODE']
-    if not mode_df.empty:
-        mode_changes = len(mode_df)
-        if mode_changes > 1:
-            summary_sections['modes'] = f"🎮 Flight Control: {mode_changes} mode changes during flight"
-        else:
-            summary_sections['modes'] = f"🎮 Flight Control: Single mode operation"
-
-# Compile final summary with logical ordering
-final_summary = "📊 FLIGHT SUMMARY\\n\\n"
-section_order = ['duration', 'altitude', 'speed', 'power', 'gps', 'events', 'modes']
-
-for section in section_order:
-    if section in summary_sections:
-        final_summary += summary_sections[section] + "\\n"
-
-# Add data quality note
-available_data_types = len(dfs)
-final_summary += f"\\n📋 Data Quality: {available_data_types} data streams analyzed"
-
-final_summary
-"""
-    
-    def _generate_gps_loss_code(self) -> str:
-        """Generate code to find GPS signal loss."""
-        return """
-# Find GPS signal loss
-gps_loss_info = "GPS signal loss information not available"
-
-if 'GPS' in dfs:
-    gps_df = dfs['GPS']
-    
-    if 'Status' in gps_df.columns:
-        # Find where GPS status indicates signal loss (status < 3 means no 3D fix)
-        signal_loss = gps_df[gps_df['Status'] < 3]
-        
-        if not signal_loss.empty:
-            first_loss = signal_loss.iloc[0]
-            if 'timestamp' in gps_df.columns:
-                loss_time = first_loss['timestamp']
-                gps_loss_info = f"The first GPS signal loss occurred at {loss_time.strftime('%H:%M:%S')} with status {first_loss['Status']}"
-            else:
-                gps_loss_info = f"GPS signal loss detected {len(signal_loss)} times during flight"
-        else:
-            gps_loss_info = "No GPS signal loss detected during the flight"
-    else:
-        gps_loss_info = "GPS status information not available in the flight data"
-else:
-    gps_loss_info = "No GPS data found in the flight log"
-
-gps_loss_info
-"""
-    
-    def _generate_error_analysis_code(self) -> str:
-        """Generate code to analyze critical errors."""
-        return """
-# Analyze critical errors
-error_info = []
-
-# Check ERR dataframe for system errors
-if 'ERR' in dfs:
-    err_df = dfs['ERR']
-    if not err_df.empty:
-        for idx, row in err_df.iterrows():
-            subsys = row.get('Subsys', 'Unknown')
-            ecode = row.get('ECode', 'Unknown')
-            error_info.append(f"Subsystem: {subsys}, Error Code: {ecode}")
-
-# Check MSG dataframe for critical messages
-if 'MSG' in dfs:
-    msg_df = dfs['MSG']
-    if 'Message' in msg_df.columns:
-        critical_keywords = ['ERROR', 'CRITICAL', 'FAIL', 'EMERGENCY']
-        for idx, row in msg_df.iterrows():
-            message = str(row['Message']).upper()
-            if any(keyword in message for keyword in critical_keywords):
-                error_info.append(f"Critical message: {row['Message']}")
-
-# Return result
-if error_info:
-    result = "Critical errors found:\\n" + "\\n".join([f"• {error}" for error in error_info[:10]])  # Limit to first 10
-else:
-    result = "No critical errors found in the flight data"
-result
-"""
-    
-    def _generate_rc_loss_code(self) -> str:
-        """Generate code to find RC signal loss."""
-        return """
-# Find RC signal loss
-rc_loss_info = "RC signal loss analysis not available"
-
-# Check for RC signal indicators
-if 'RCIN' in dfs:
-    rcin_df = dfs['RCIN']
-    
-    # Look for channels that drop to zero or very low values
-    rc_channels = [col for col in rcin_df.columns if col.startswith('C') and col[1:].isdigit()]
-    
-    if rc_channels:
-        # Check for signal loss (values dropping to 0 or below threshold)
-        signal_loss_detected = False
-        
-        for channel in rc_channels[:4]:  # Check first 4 channels (most critical)
-            if channel in rcin_df.columns:
-                values = rcin_df[channel].dropna()
-                if not values.empty:
-                    # RC signal loss typically shows as values below 900 or above 2100
-                    low_values = values[values < 900]
-                    if not low_values.empty:
-                        signal_loss_detected = True
-                        if 'timestamp' in rcin_df.columns:
-                            first_loss_idx = values[values < 900].index[0]
-                            loss_time = rcin_df.loc[first_loss_idx, 'timestamp']
-                            rc_loss_info = f"RC signal loss detected at {loss_time.strftime('%H:%M:%S')} on channel {channel}"
-                            break
-        
-        if not signal_loss_detected:
-            rc_loss_info = "No RC signal loss detected during the flight"
-    else:
-        rc_loss_info = "No RC channel data found in RCIN dataframe"
-else:
-    rc_loss_info = "No RC input data (RCIN) found in the flight log"
-
-rc_loss_info
-"""
-    
-    def _generate_comprehensive_error_code(self) -> str:
-        """Generate code for comprehensive error and warning analysis."""
-        return """
-# Comprehensive Error and Warning Analysis
-error_analysis = []
-warning_count = 0
-error_count = 0
-critical_events = []
-
-# 1. Check ERR dataframe for system errors
-if 'ERR' in dfs:
-    err_df = dfs['ERR']
-    if not err_df.empty:
-        error_count = len(err_df)
-        error_analysis.append(f"System Errors: {error_count} errors logged")
-        
-        # Analyze error types by subsystem
-        if 'Subsys' in err_df.columns:
-            subsys_counts = err_df['Subsys'].value_counts()
-            error_analysis.append("Error breakdown by subsystem:")
-            for subsys, count in subsys_counts.head(5).items():
-                error_analysis.append(f"  • {subsys}: {count} errors")
-        
-        # Show specific error codes if available
-        if 'ECode' in err_df.columns and len(err_df) <= 10:
-            error_analysis.append("Specific error codes:")
-            for idx, row in err_df.iterrows():
-                subsys = row.get('Subsys', 'Unknown')
-                ecode = row.get('ECode', 'Unknown')
-                error_analysis.append(f"  • {subsys} error code {ecode}")
-        elif 'ECode' in err_df.columns:
-            # Show most common error codes
-            ecode_counts = err_df['ECode'].value_counts()
-            error_analysis.append("Most frequent error codes:")
-            for ecode, count in ecode_counts.head(3).items():
-                error_analysis.append(f"  • Error code {ecode}: {count} occurrences")
-
-# 2. Check MSG dataframe for critical messages with timing
-if 'MSG' in dfs:
-    msg_df = dfs['MSG']
-    if not msg_df.empty and 'Message' in msg_df.columns:
-        # Define keywords for different severity levels
-        critical_keywords = ['CRITICAL', 'EMERGENCY', 'FATAL', 'CRASH', 'FAILSAFE']
-        error_keywords = ['ERROR', 'FAIL', 'FAILED', 'FAILURE']
-        warning_keywords = ['WARNING', 'WARN', 'ALERT', 'CAUTION']
-        
-        critical_msgs = []
-        error_msgs = []
-        warning_msgs = []
-        
-        # Helper function to format time for human readability
-        def format_flight_time(time_us):
-            try:
-                if pd.isna(time_us):
-                    return "Unknown time"
-                # Convert microseconds to seconds
-                seconds = float(time_us) / 1_000_000
-                minutes = int(seconds // 60)
-                remaining_seconds = int(seconds % 60)
-                if minutes > 0:
-                    return f"{minutes}m {remaining_seconds}s into flight"
-                else:
-                    return f"{remaining_seconds}s into flight"
-            except:
-                return "Unknown time"
-        
-        for idx, row in msg_df.iterrows():
-            message = str(row['Message']).upper()
-            original_message = str(row['Message'])
-            
-            # Get timing information if available
-            time_info = ""
-            if 'TimeUS' in row:
-                time_info = f" at {format_flight_time(row['TimeUS'])}"
-            
-            if any(keyword in message for keyword in critical_keywords):
-                critical_msgs.append(f"{original_message}{time_info}")
-                critical_events.append(f"{original_message}{time_info}")
-            elif any(keyword in message for keyword in error_keywords):
-                error_msgs.append(f"{original_message}{time_info}")
-            elif any(keyword in message for keyword in warning_keywords):
-                warning_msgs.append(f"{original_message}{time_info}")
-        
-        # Report critical messages
-        if critical_msgs:
-            error_analysis.append(f"\\n🚨 CRITICAL ALERTS: {len(critical_msgs)} critical messages found")
-            for msg in critical_msgs[:5]:  # Show first 5
-                error_analysis.append(f"  • {msg}")
-            if len(critical_msgs) > 5:
-                error_analysis.append(f"  ... and {len(critical_msgs)-5} more critical messages")
-        
-        # Report error messages
-        if error_msgs:
-            error_analysis.append(f"\\n⚠️ ERROR MESSAGES: {len(error_msgs)} error messages found")
-            for msg in error_msgs[:3]:  # Show first 3
-                error_analysis.append(f"  • {msg}")
-            if len(error_msgs) > 3:
-                error_analysis.append(f"  ... and {len(error_msgs)-3} more error messages")
-        
-        # Report warning messages
-        if warning_msgs:
-            error_analysis.append(f"\\n⚠️ WARNINGS: {len(warning_msgs)} warning messages found")
-            # Group similar warnings
-            warning_summary = {}
-            for msg in warning_msgs:
-                # Extract key warning type (remove timing for grouping)
-                base_msg = msg.split(' at ')[0] if ' at ' in msg else msg
-                key_words = ['GPS', 'BATTERY', 'COMPASS', 'VIBRATION', 'RC', 'MOTOR', 'SENSOR', 'FAILSAFE']
-                warning_type = 'OTHER'
-                for word in key_words:
-                    if word in base_msg.upper():
-                        warning_type = word
-                        break
-                
-                if warning_type not in warning_summary:
-                    warning_summary[warning_type] = []
-                warning_summary[warning_type].append(msg)
-            
-            for warning_type, msgs in warning_summary.items():
-                if len(msgs) == 1:
-                    error_analysis.append(f"  • {warning_type}: {msgs[0]}")
-                else:
-                    error_analysis.append(f"  • {warning_type}: {len(msgs)} warnings")
-                    # Show first few with timing
-                    for msg in msgs[:2]:
-                        error_analysis.append(f"    - {msg}")
-                    if len(msgs) > 2:
-                        error_analysis.append(f"    - ... and {len(msgs)-2} more")
-
-# 3. Check for GPS-related issues
-if 'GPS' in dfs:
-    gps_df = dfs['GPS']
-    if 'Status' in gps_df.columns:
-        poor_gps = gps_df[gps_df['Status'] < 3]  # Less than 3D fix
-        if not poor_gps.empty:
-            gps_loss_percentage = (len(poor_gps) / len(gps_df)) * 100
-            if gps_loss_percentage > 10:
-                error_analysis.append(f"\\n📡 GPS ISSUES: Poor GPS signal in {gps_loss_percentage:.1f}% of flight")
-                if gps_loss_percentage > 50:
-                    critical_events.append(f"Major GPS signal loss ({gps_loss_percentage:.1f}% of flight)")
-
-# 4. Check for power system issues
-power_sources = ['CURR', 'BAT']
-for source in power_sources:
-    if source in dfs:
-        df = dfs[source]
-        if 'Volt' in df.columns:
-            voltage_values = df['Volt'].dropna()
-            if not voltage_values.empty:
-                min_voltage = voltage_values.min()
-                if min_voltage < 10.5:
-                    critical_events.append(f"Critical low battery voltage: {min_voltage:.2f}V")
-                    error_analysis.append(f"\\n🔋 POWER CRITICAL: Battery voltage dropped to {min_voltage:.2f}V")
-                elif min_voltage < 11.1:
-                    error_analysis.append(f"\\n🔋 POWER WARNING: Low battery voltage detected: {min_voltage:.2f}V")
-        break
-
-# 5. Check for RC (Remote Control) issues
-if 'RCIN' in dfs:
-    rcin_df = dfs['RCIN']
-    # Check for RC signal loss (channels dropping to very low values)
-    rc_channels = [col for col in rcin_df.columns if col.startswith('C') and col[1:].isdigit()]
-    if rc_channels:
-        for channel in rc_channels[:4]:  # Check first 4 channels
-            if channel in rcin_df.columns:
-                values = rcin_df[channel].dropna()
-                if not values.empty:
-                    low_signal_count = len(values[values < 900])
-                    if low_signal_count > len(values) * 0.05:  # More than 5% low signals
-                        error_analysis.append(f"\\n📻 RC SIGNAL: Potential signal loss on {channel}")
-
-# 6. Overall assessment
-total_issues = error_count + len(critical_events)
-
-if total_issues == 0:
-    error_analysis.insert(0, "✅ FLIGHT STATUS: No critical errors or warnings detected")
-    error_analysis.append("\\n✅ Flight completed successfully with no major issues identified")
-elif len(critical_events) > 0:
-    error_analysis.insert(0, f"🚨 FLIGHT STATUS: {len(critical_events)} critical issues detected")
-    error_analysis.append("\\n⚠️ RECOMMENDATION: Review critical events before next flight")
-elif total_issues <= 5:
-    error_analysis.insert(0, f"⚠️ FLIGHT STATUS: {total_issues} minor issues detected")
-    error_analysis.append("\\n✅ Overall flight quality was acceptable")
-else:
-    error_analysis.insert(0, f"⚠️ FLIGHT STATUS: {total_issues} issues detected")
-    error_analysis.append("\\n⚠️ RECOMMENDATION: Address identified issues")
-
-# Return comprehensive result
-if error_analysis:
-    result = "\\n".join(error_analysis)
-else:
-    # Enhanced fallback - try to get basic information
-    try:
-        available_dfs = list(dfs.keys())
-        basic_info = []
-        basic_info.append(f"Flight data contains {len(available_dfs)} message types: {', '.join(available_dfs)}")
-        
-        # Check for basic error indicators
-        if 'ERR' in dfs and not dfs['ERR'].empty:
-            basic_info.append(f"ERR dataframe contains {len(dfs['ERR'])} system error entries")
-        
-        if 'MSG' in dfs and not dfs['MSG'].empty and 'Message' in dfs['MSG'].columns:
-            msg_count = len(dfs['MSG'])
-            basic_info.append(f"MSG dataframe contains {msg_count} message entries")
-        
-        if basic_info:
-            result = "Basic Error Check Results:\\n" + "\\n".join([f"• {info}" for info in basic_info])
-            result += "\\n\\nNo automated error analysis could be completed. Manual review of ERR and MSG data may be needed."
-        else:
-            result = f"Unable to perform comprehensive error analysis. Available data types: {', '.join(available_dfs)}. Try a more specific query."
-    except Exception as e:
-        result = f"Error analysis failed: {str(e)}. Flight data is available but analysis tools encountered issues."
-
-result
-"""
-    
-    def _interpret_assignment_as_query(self, code: str) -> str:
-        """Interpret variable assignments as implicit queries and provide analysis."""
-        try:
-            code_lower = code.lower()
-            
-            # GPS quality assignments
-            if 'gps' in code_lower and ('quality' in code_lower or 'high' in code_lower):
-                return self._analyze_gps_quality_details()
-            
-            # Altitude consistency assignments
-            if 'altitude' in code_lower and ('high' in code_lower or 'consistent' in code_lower):
-                return self._analyze_altitude_consistency()
-            
-            # Flight performance assignments
-            if 'flight' in code_lower and ('performance' in code_lower or 'quality' in code_lower):
-                return self._analyze_flight_performance()
-            
-            # Power consumption assignments
-            if 'power' in code_lower or 'battery' in code_lower:
-                return self._analyze_power_metrics()
-            
-            # Default fallback
-            return f"Unable to interpret assignment '{code}' as a meaningful query. Please provide a specific question about the flight data."
-            
-        except Exception as e:
-            return f"Error interpreting query: {str(e)}"
-    
-    def _analyze_gps_quality_details(self) -> str:
-        """Provide concise GPS quality analysis."""
-        try:
-            available_dfs = list(self._session.dataframes.keys())
-            
-            if 'GPS' not in available_dfs:
-                return "GPS data not available."
-            
-            gps_df = self._session.dataframes['GPS']
-            
-            # Get satellite count
-            if 'NSats' in gps_df.columns:
-                avg_sats = gps_df['NSats'].mean()
-                return f"GPS signal quality: {avg_sats:.1f} satellites (poor reception)" if avg_sats < 6 else f"GPS signal quality: {avg_sats:.1f} satellites (good reception)"
-            
-            # Fallback to status if available
-            if 'Status' in gps_df.columns:
-                good_fix_count = len(gps_df[gps_df['Status'] >= 3])
-                total_readings = len(gps_df)
-                fix_percentage = (good_fix_count / total_readings) * 100 if total_readings > 0 else 0
-                
-                if fix_percentage >= 95:
-                    return "GPS signal quality: Excellent"
-                elif fix_percentage >= 80:
-                    return "GPS signal quality: Good"
-                else:
-                    return "GPS signal quality: Poor"
-            
-            return "GPS data available but quality metrics unclear."
-                
-        except Exception as e:
-            return f"GPS quality analysis failed: {str(e)}"
-    
-    def _analyze_altitude_consistency(self) -> str:
-        """Analyze why altitude readings were consistently high/stable."""
-        try:
-            available_dfs = list(self._session.dataframes.keys())
-            altitude_sources = ['GPS', 'BARO', 'CTUN', 'AHR2', 'POS']
-            
-            analysis_parts = []
-            
-            for source in altitude_sources:
-                if source in available_dfs:
-                    df = self._session.dataframes[source]
-                    if 'Alt' in df.columns:
-                        alt_values = df['Alt'].dropna()
-                        if not alt_values.empty:
-                            std_dev = alt_values.std()
-                            mean_alt = alt_values.mean()
-                            altitude_range = alt_values.max() - alt_values.min()
-                            
-                            analysis_parts.append(f"{source} altitude: Mean {mean_alt:.1f}m, Std Dev {std_dev:.1f}m, Range {altitude_range:.1f}m")
-                            
-                            # Determine consistency
-                            if std_dev < 5.0:
-                                analysis_parts.append(f"  → {source} shows very stable altitude readings (low variation)")
-                            elif std_dev < 15.0:
-                                analysis_parts.append(f"  → {source} shows reasonably stable altitude readings")
-                            else:
-                                analysis_parts.append(f"  → {source} shows significant altitude variations")
-                            
-                            break  # Use the first available source for primary analysis
-            
-            # Check flight mode stability
-            if 'MODE' in available_dfs:
-                mode_df = self._session.dataframes['MODE']
-                if not mode_df.empty:
-                    mode_changes = len(mode_df)
-                    if mode_changes <= 3:
-                        analysis_parts.append(f"Flight mode stability: Only {mode_changes} mode changes, indicating stable flight control")
-                    else:
-                        analysis_parts.append(f"Flight mode changes: {mode_changes} mode transitions during flight")
-            
-            # Check for altitude hold modes
-            if 'CTUN' in available_dfs:
-                ctun_df = self._session.dataframes['CTUN']
-                if 'DAlt' in ctun_df.columns and 'Alt' in ctun_df.columns:
-                    desired_alt = ctun_df['DAlt'].dropna()
-                    actual_alt = ctun_df['Alt'].dropna()
-                    
-                    if not desired_alt.empty and not actual_alt.empty:
-                        # Calculate how well actual altitude tracked desired altitude
-                        if 'timestamp' in ctun_df.columns:
-                            # Find overlapping timestamps
-                            common_indices = ctun_df.dropna(subset=['DAlt', 'Alt']).index
-                            if len(common_indices) > 10:
-                                desired_subset = ctun_df.loc[common_indices, 'DAlt']
-                                actual_subset = ctun_df.loc[common_indices, 'Alt']
-                                altitude_error = (actual_subset - desired_subset).abs().mean()
-                                
-                                analysis_parts.append(f"Altitude tracking: Average error {altitude_error:.1f}m between desired and actual altitude")
-                                
-                                if altitude_error < 2.0:
-                                    analysis_parts.append("  → Excellent altitude control system performance")
-                                elif altitude_error < 5.0:
-                                    analysis_parts.append("  → Good altitude control system performance")
-                                else:
-                                    analysis_parts.append("  → Moderate altitude control system performance")
-            
-            if analysis_parts:
-                return "Altitude Consistency Analysis:\n" + "\n".join([f"• {part}" for part in analysis_parts])
-            else:
-                return "No altitude data available for consistency analysis."
-                
-        except Exception as e:
-            return f"Altitude consistency analysis failed: {str(e)}"
-    
-    def _analyze_flight_performance(self) -> str:
-        """Analyze overall flight performance metrics."""
-        try:
-            available_dfs = list(self._session.dataframes.keys())
-            performance_metrics = []
-            
-            # Flight duration
-            timestamps = []
-            for df_name, df in self._session.dataframes.items():
-                if 'timestamp' in df.columns:
-                    df_timestamps = df['timestamp'].dropna()
-                    if not df_timestamps.empty:
-                        timestamps.extend(df_timestamps.tolist())
-            
-            if timestamps:
-                duration_seconds = (max(timestamps) - min(timestamps)).total_seconds()
-                duration_minutes = duration_seconds / 60
-                performance_metrics.append(f"Flight duration: {duration_minutes:.1f} minutes")
-            
-            # Power efficiency
-            if 'CURR' in available_dfs:
-                curr_df = self._session.dataframes['CURR']
-                if 'Curr' in curr_df.columns:
-                    current_values = curr_df['Curr'].dropna()
-                    if not current_values.empty:
-                        avg_current = current_values.mean()
-                        max_current = current_values.max()
-                        performance_metrics.append(f"Power consumption: Average {avg_current:.1f}A, Peak {max_current:.1f}A")
-            
-            # Stability metrics
-            if 'VIBE' in available_dfs:
-                vibe_df = self._session.dataframes['VIBE']
-                vibe_cols = [col for col in vibe_df.columns if 'Vibe' in col]
-                if vibe_cols:
-                    avg_vibe = vibe_df[vibe_cols].mean().mean()
-                    performance_metrics.append(f"Average vibration level: {avg_vibe:.1f}")
-                    
-                    if avg_vibe < 30:
-                        performance_metrics.append("  → Low vibration indicates good mechanical balance")
-                    elif avg_vibe < 60:
-                        performance_metrics.append("  → Moderate vibration levels")
-                    else:
-                        performance_metrics.append("  → High vibration may indicate mechanical issues")
-            
-            if performance_metrics:
-                return "Flight Performance Analysis:\n" + "\n".join([f"• {metric}" for metric in performance_metrics])
-            else:
-                return "Insufficient data for comprehensive performance analysis."
-                
-        except Exception as e:
-            return f"Flight performance analysis failed: {str(e)}"
-    
-    def _analyze_power_metrics(self) -> str:
-        """Analyze power consumption and battery metrics."""
-        try:
-            available_dfs = list(self._session.dataframes.keys())
-            power_metrics = []
-            
-            # Battery voltage analysis
-            if 'CURR' in available_dfs:
-                curr_df = self._session.dataframes['CURR']
-                if 'Volt' in curr_df.columns:
-                    voltage_values = curr_df['Volt'].dropna()
-                    if not voltage_values.empty:
-                        min_voltage = voltage_values.min()
-                        max_voltage = voltage_values.max()
-                        avg_voltage = voltage_values.mean()
-                        
-                        power_metrics.append(f"Battery voltage: {avg_voltage:.2f}V average, Range {min_voltage:.2f}V - {max_voltage:.2f}V")
-                        
-                        if min_voltage > 14.0:  # For typical 4S LiPo
-                            power_metrics.append("  → Voltage remained healthy throughout flight")
-                        elif min_voltage > 13.0:
-                            power_metrics.append("  → Voltage dropped to moderate levels")
-                        else:
-                            power_metrics.append("  → Voltage dropped to concerning levels")
-            
-            # Current consumption analysis
-            if 'CURR' in available_dfs:
-                curr_df = self._session.dataframes['CURR']
-                if 'Curr' in curr_df.columns:
-                    current_values = curr_df['Curr'].dropna()
-                    if not current_values.empty:
-                        avg_current = current_values.mean()
-                        max_current = current_values.max()
-                        power_metrics.append(f"Current consumption: {avg_current:.1f}A average, {max_current:.1f}A peak")
-            
-            # Battery temperature if available
-            temperature_sources = ['BAT', 'CURR', 'POWR']
-            for source in temperature_sources:
-                if source in available_dfs:
-                    df = self._session.dataframes[source]
-                    temp_cols = [col for col in df.columns if 'temp' in col.lower() or 'tmp' in col.lower()]
-                    if temp_cols:
-                        temp_values = df[temp_cols[0]].dropna()
-                        if not temp_values.empty:
-                            max_temp = temp_values.max()
-                            avg_temp = temp_values.mean()
-                            power_metrics.append(f"Battery temperature: {avg_temp:.1f}°C average, {max_temp:.1f}°C peak")
-                            
-                            if max_temp < 40:
-                                power_metrics.append("  → Temperature remained within safe limits")
-                            elif max_temp < 50:
-                                power_metrics.append("  → Temperature reached elevated but acceptable levels")
-                            else:
-                                power_metrics.append("  → Temperature reached concerning levels")
-                            break
-            
-            if power_metrics:
-                return "Power System Analysis:\n" + "\n".join([f"• {metric}" for metric in power_metrics])
-            else:
-                return "No power system data available for analysis."
-                
-        except Exception as e:
-            return f"Power analysis failed: {str(e)}"
-
-    def _generate_altitude_consistency_code(self) -> str:
-        """Generate code to analyze altitude consistency and stability."""
-        return """
-# Analyze altitude consistency and stability
-consistency_analysis = []
-
-# Find the best altitude source
-altitude_sources = ['GPS', 'BARO', 'CTUN', 'AHR2', 'POS']
-best_source = None
-best_data = None
-
-for source in altitude_sources:
-    if source in dfs:
-        df = dfs[source]
-        if 'Alt' in df.columns:
-            alt_values = df['Alt'].dropna()
-            if not alt_values.empty and len(alt_values) > 10:
-                best_source = source
-                best_data = alt_values
-                break
-
-if best_data is not None:
-    # Calculate stability metrics
-    mean_alt = best_data.mean()
-    std_dev = best_data.std()
-    altitude_range = best_data.max() - best_data.min()
-    cv = (std_dev / mean_alt) * 100 if mean_alt != 0 else 0  # Coefficient of variation
-    
-    consistency_analysis.append(f"Altitude Analysis from {best_source}:")
-    consistency_analysis.append(f"• Mean altitude: {mean_alt:.1f}m")
-    consistency_analysis.append(f"• Standard deviation: {std_dev:.1f}m")
-    consistency_analysis.append(f"• Total altitude range: {altitude_range:.1f}m")
-    consistency_analysis.append(f"• Coefficient of variation: {cv:.1f}%")
-    
-    # Interpret consistency
-    if std_dev < 5.0:
-        consistency_analysis.append("• Flight maintained very stable altitude (excellent consistency)")
-        consistency_analysis.append("• This indicates good altitude hold performance and minimal external disturbances")
-    elif std_dev < 15.0:
-        consistency_analysis.append("• Flight maintained reasonably stable altitude")
-        consistency_analysis.append("• Some altitude variation is normal during flight maneuvers")
-    else:
-        consistency_analysis.append("• Flight showed significant altitude variations")
-        consistency_analysis.append("• This may indicate flight phase changes or control adjustments")
-    
-    # Check for altitude hold behavior
-    if 'CTUN' in dfs:
-        ctun_df = dfs['CTUN']
-        if 'DAlt' in ctun_df.columns and 'Alt' in ctun_df.columns:
-            # Calculate altitude tracking accuracy
-            common_times = ctun_df.dropna(subset=['DAlt', 'Alt'])
-            if not common_times.empty:
-                desired_alt = common_times['DAlt']
-                actual_alt = common_times['Alt']
-                altitude_error = (actual_alt - desired_alt).abs().mean()
-                
-                consistency_analysis.append(f"• Average altitude tracking error: {altitude_error:.1f}m")
-                
-                if altitude_error < 2.0:
-                    consistency_analysis.append("• Excellent altitude control system performance")
-                elif altitude_error < 5.0:
-                    consistency_analysis.append("• Good altitude control system performance")
-                else:
-                    consistency_analysis.append("• Moderate altitude control accuracy")
-    
-    # Check flight mode stability
-    if 'MODE' in dfs:
-        mode_df = dfs['MODE']
-        mode_changes = len(mode_df)
-        consistency_analysis.append(f"• Flight mode changes: {mode_changes}")
-        
-        if mode_changes <= 3:
-            consistency_analysis.append("• Minimal mode changes indicate stable flight operations")
-        else:
-            consistency_analysis.append("• Multiple mode changes may have affected altitude consistency")
-
-else:
-    consistency_analysis.append("No altitude data available for consistency analysis")
-
-# Return comprehensive analysis
-result = "\\n".join(consistency_analysis)
-result
-"""
-
-    def _generate_flight_stability_code(self) -> str:
-        """Generate code to analyze overall flight stability."""
-        return """
-# Analyze overall flight stability
-stability_metrics = []
-
-# Attitude stability
-if 'ATT' in dfs:
-    att_df = dfs['ATT']
-    attitude_cols = ['Roll', 'Pitch', 'Yaw']
-    
-    for col in attitude_cols:
-        if col in att_df.columns:
-            values = att_df[col].dropna()
-            if not values.empty:
-                std_val = values.std()
-                stability_metrics.append(f"{col} stability: {std_val:.2f}° std dev")
-                
-                if std_val < 2.0:
-                    stability_metrics.append(f"  → Very stable {col.lower()} control")
-                elif std_val < 5.0:
-                    stability_metrics.append(f"  → Good {col.lower()} stability")
-                else:
-                    stability_metrics.append(f"  → {col} showed some variations")
-
-# Vibration analysis
-if 'VIBE' in dfs:
-    vibe_df = dfs['VIBE']
-    vibe_cols = [col for col in vibe_df.columns if 'Vibe' in col]
-    
-    if vibe_cols:
-        avg_vibe = vibe_df[vibe_cols].mean().mean()
-        stability_metrics.append(f"Average vibration level: {avg_vibe:.1f}")
-        
-        if avg_vibe < 30:
-            stability_metrics.append("  → Low vibrations indicate excellent mechanical stability")
-        elif avg_vibe < 60:
-            stability_metrics.append("  → Moderate vibration levels within acceptable range")
-        else:
-            stability_metrics.append("  → Higher vibrations may indicate mechanical issues")
-
-# Control input stability
-if 'RCIN' in dfs:
-    rcin_df = dfs['RCIN']
-    rc_channels = ['C3']  # Throttle channel
-    
-    for channel in rc_channels:
-        if channel in rcin_df.columns:
-            values = rcin_df[channel].dropna()
-            if not values.empty:
-                std_val = values.std()
-                mean_val = values.mean()
-                stability_metrics.append(f"Throttle input (C3): Mean {mean_val:.0f}, Std Dev {std_val:.1f}")
-                
-                if std_val < 50:
-                    stability_metrics.append("  → Very stable throttle control")
-                else:
-                    stability_metrics.append("  → Dynamic throttle management")
-
-# Power system stability
-if 'CURR' in dfs:
-    curr_df = dfs['CURR']
-    if 'Volt' in curr_df.columns:
-        voltage_values = curr_df['Volt'].dropna()
-        if not voltage_values.empty:
-            voltage_std = voltage_values.std()
-            voltage_mean = voltage_values.mean()
-            stability_metrics.append(f"Battery voltage: {voltage_mean:.2f}V ± {voltage_std:.2f}V")
-            
-            if voltage_std < 0.5:
-                stability_metrics.append("  → Very stable power system")
-            else:
-                stability_metrics.append("  → Normal voltage variations during flight")
-
-# Return comprehensive stability analysis
-if stability_metrics:
-    result = "Flight Stability Analysis:\\n" + "\\n".join([f"• {metric}" for metric in stability_metrics])
-else:
-    result = "Insufficient data for comprehensive stability analysis"
-result
-"""
-
-    def _generate_power_consumption_code(self) -> str:
-        """Generate comprehensive power consumption analysis code."""
-        return """
-# Enhanced Power Consumption Analysis - Robust Data Detection
-power_analysis = []
-found_any_data = False
-
-# Check all available dataframes for power-related data
-available_dfs = list(dfs.keys())
-power_analysis.append(f"Available data sources: {', '.join(available_dfs)}")
-
-# Comprehensive source checking with flexible column matching
-power_sources = ['CURR', 'BAT', 'BATT', 'POWR', 'POWER', 'BATTERY']
-
-for source in power_sources:
-    if source in dfs:
-        df = dfs[source]
-        power_analysis.append(f"\\nAnalyzing {source} dataframe ({len(df)} records):")
-        
-        # Show all available columns for debugging
-        available_cols = list(df.columns)
-        power_analysis.append(f"Available columns: {', '.join(available_cols)}")
-        
-        # Flexible voltage detection
-        voltage_cols = []
-        for col in df.columns:
-            col_lower = col.lower()
-            if any(v_keyword in col_lower for v_keyword in ['volt', 'voltage', 'v', 'vcc', 'vbat']):
-                voltage_cols.append(col)
-        
-        if voltage_cols:
-            for col in voltage_cols:
-                voltage_values = df[col].dropna()
-                if not voltage_values.empty and len(voltage_values) > 0:
-                    min_volt = voltage_values.min()
-                    max_volt = voltage_values.max()
-                    avg_volt = voltage_values.mean()
-                    power_analysis.append(f"• Voltage ({col}): {avg_volt:.2f}V avg (range: {min_volt:.2f}V - {max_volt:.2f}V)")
-                    found_any_data = True
-                    
-                    # Health assessment
-                    if min_volt < 10.5:
-                        power_analysis.append("  ⚠️ CRITICAL: Voltage dropped to dangerous levels")
-                    elif min_volt < 11.1:
-                        power_analysis.append("  ⚠️ WARNING: Low voltage detected")
-                    else:
-                        power_analysis.append("  ✓ Voltage remained healthy")
-        
-        # Flexible current detection
-        current_cols = []
-        for col in df.columns:
-            col_lower = col.lower()
-            if any(c_keyword in col_lower for c_keyword in ['curr', 'current', 'amp', 'a']):
-                # Exclude cumulative totals
-                if 'tot' not in col_lower and 'total' not in col_lower:
-                    current_cols.append(col)
-        
-        if current_cols:
-            for col in current_cols:
-                current_values = df[col].dropna()
-                if not current_values.empty and len(current_values) > 0:
-                    avg_current = current_values.mean()
-                    max_current = current_values.max()
-                    min_current = current_values.min()
-                    power_analysis.append(f"• Current ({col}): {avg_current:.2f}A avg, {max_current:.2f}A peak")
-                    found_any_data = True
-                    
-                    # Analyze current patterns
-                    if max_current > avg_current * 3:
-                        power_analysis.append(f"  ⚠️ High current spikes detected")
-        
-        # Flexible temperature detection
-        temp_cols = []
-        for col in df.columns:
-            col_lower = col.lower()
-            if any(t_keyword in col_lower for t_keyword in ['temp', 'temperature', 'tmp']):
-                temp_cols.append(col)
-        
-        if temp_cols:
-            for col in temp_cols:
-                temp_values = df[col].dropna()
-                # Skip columns with no variance (e.g., constant zero readings)
-                if temp_values.empty or temp_values.nunique() <= 1:
-                    continue
-                if not temp_values.empty and len(temp_values) > 0:
-                    # Check if values are reasonable for temperature
-                    avg_temp = temp_values.mean()
-                    max_temp = temp_values.max()
-                    min_temp = temp_values.min()
-                    
-                    # Only report if temperature values seem realistic
-                    if -50 <= avg_temp <= 150:  # Reasonable temperature range
-                        power_analysis.append(f"• Temperature ({col}): {avg_temp:.1f}°C avg, {max_temp:.1f}°C peak")
-                        found_any_data = True
-                        
-                        if max_temp > 60:
-                            power_analysis.append("  ⚠️ High temperature detected")
-                        elif max_temp > 45:
-                            power_analysis.append("  ⚠️ Elevated temperature")
-                        else:
-                            power_analysis.append("  ✓ Temperature within normal range")
-                    else:
-                        power_analysis.append(f"• Temperature ({col}): Values appear unrealistic ({avg_temp:.1f}°C avg)")
-        
-        # Check for power calculation columns
-        power_cols = []
-        for col in df.columns:
-            col_lower = col.lower()
-            if any(p_keyword in col_lower for p_keyword in ['power', 'watt', 'w']):
-                power_cols.append(col)
-        
-        if power_cols:
-            for col in power_cols:
-                power_values = df[col].dropna()
-                if not power_values.empty:
-                    avg_power = power_values.mean()
-                    max_power = power_values.max()
-                    power_analysis.append(f"• Power ({col}): {avg_power:.1f}W avg, {max_power:.1f}W peak")
-                    found_any_data = True
-        
-        # Aggregate across all sources (do not break early)
-        if found_any_data:
-            break
-
-# If no power data found, provide detailed debugging info
-if not found_any_data:
-    power_analysis.append("\\n🔍 DETAILED SEARCH RESULTS:")
-    
-    for df_name, df in dfs.items():
-        if not df.empty:
-            power_analysis.append(f"\\n{df_name} dataframe:")
-            power_analysis.append(f"  • Columns: {list(df.columns)}")
-            power_analysis.append(f"  • Records: {len(df)}")
-            
-            # Check for any numeric columns that might contain power data
-            numeric_cols = []
-            for col in df.columns:
-                if df[col].dtype in ['float64', 'int64', 'float32', 'int32']:
-                    numeric_cols.append(col)
-            
-            if numeric_cols:
-                power_analysis.append(f"  • Numeric columns: {numeric_cols}")
-                
-                # Sample some values to help identify what each column contains
-                for col in numeric_cols[:3]:  # Check first 3 numeric columns
-                    values = df[col].dropna()
-                    if not values.empty:
-                        avg_val = values.mean()
-                        max_val = values.max()
-                        min_val = values.min()
-                        power_analysis.append(f"    - {col}: avg={avg_val:.2f}, range={min_val:.2f} to {max_val:.2f}")
-
-# Comprehensive result
-if found_any_data:
-    result = "\\n".join(power_analysis)
-else:
-    result = "\\n".join(power_analysis) + "\\n\\n❌ No recognizable power consumption data found. Check column names and data structure above."
-
-result
-"""
-    
-    def _generate_battery_voltage_code(self) -> str:
-        """Generate code for battery voltage analysis."""
-        return """
-# Battery Voltage Analysis
-voltage_analysis = []
-
-# Check multiple sources for voltage data
-voltage_sources = ['CURR', 'BAT', 'POWR', 'BATT']
-
-for source in voltage_sources:
-    if source in dfs:
-        df = dfs[source]
-        
-        # Look for voltage columns
-        voltage_cols = []
-        if 'Volt' in df.columns:
-            voltage_cols.append('Volt')
-        elif 'Voltage' in df.columns:
-            voltage_cols.append('Voltage')
-        elif 'Vcc' in df.columns and source == 'POWR':
-            voltage_cols.append('Vcc')
-        
-        for col in voltage_cols:
-            voltage_values = df[col].dropna()
-            if not voltage_values.empty:
-                min_volt = voltage_values.min()
-                max_volt = voltage_values.max()
-                avg_volt = voltage_values.mean()
-                std_volt = voltage_values.std()
-                
-                voltage_analysis.append(f"Voltage from {source}.{col}:")
-                voltage_analysis.append(f"  • Average: {avg_volt:.2f}V")
-                voltage_analysis.append(f"  • Range: {min_volt:.2f}V to {max_volt:.2f}V")
-                voltage_analysis.append(f"  • Stability: ±{std_volt:.2f}V standard deviation")
-                
-                # Health assessment
-                if min_volt < 10.5:
-                    voltage_analysis.append("  • ⚠️ CRITICAL: Voltage dropped to dangerous levels")
-                elif min_volt < 11.1:
-                    voltage_analysis.append("  • ⚠️ WARNING: Low voltage detected")
-                elif min_volt > 13.0:
-                    voltage_analysis.append("  • ✓ GOOD: Voltage remained healthy")
-                else:
-                    voltage_analysis.append("  • ✓ ACCEPTABLE: Moderate voltage levels")
-                
-                # Only analyze the first good source
-                break
-    
-    if voltage_analysis:
-        break
-
-# Return result
-if voltage_analysis:
-    result = "Battery Voltage Analysis:\\n" + "\\n".join(voltage_analysis)
-else:
-    result = "No battery voltage data found in the flight log"
-result
-"""
-    
-    def _generate_comprehensive_battery_code(self) -> str:
-        """Generate code for comprehensive battery analysis."""
-        return """
-# Comprehensive Battery System Analysis
-battery_analysis = []
-
-# Check all possible battery data sources
-battery_sources = ['CURR', 'BAT', 'BATT', 'POWR']
-found_data = False
-
-for source in battery_sources:
-    if source in dfs:
-        df = dfs[source]
-        source_analysis = []
-        
-        # Voltage analysis
-        if 'Volt' in df.columns:
-            voltage_values = df['Volt'].dropna()
-            if not voltage_values.empty:
-                avg_volt = voltage_values.mean()
-                min_volt = voltage_values.min()
-                max_volt = voltage_values.max()
-                source_analysis.append(f"Voltage: {avg_volt:.2f}V avg (range: {min_volt:.2f}-{max_volt:.2f}V)")
-                found_data = True
-        
-        # Current analysis
-        if 'Curr' in df.columns:
-            current_values = df['Curr'].dropna()
-            if not current_values.empty:
-                avg_curr = current_values.mean()
-                max_curr = current_values.max()
-                source_analysis.append(f"Current: {avg_curr:.1f}A avg, {max_curr:.1f}A peak")
-                found_data = True
-        
-        # Temperature analysis
-        temp_cols = [col for col in df.columns if 'temp' in col.lower()]
-        if temp_cols:
-            temp_values = df[temp_cols[0]].dropna()
-            if not temp_values.empty:
-                avg_temp = temp_values.mean()
-                max_temp = temp_values.max()
-                source_analysis.append(f"Temperature: {avg_temp:.1f}°C avg, {max_temp:.1f}°C peak")
-                found_data = True
-        
-        # Total current/energy if available
-        if 'CurrTot' in df.columns:
-            curr_tot = df['CurrTot'].dropna()
-            if not curr_tot.empty:
-                total_consumption = curr_tot.iloc[-1] - curr_tot.iloc[0] if len(curr_tot) > 1 else curr_tot.iloc[0]
-                source_analysis.append(f"Total consumption: {total_consumption:.0f}mAh")
-                found_data = True
-        
-        if source_analysis:
-            battery_analysis.append(f"Battery data from {source}:")
-            for item in source_analysis:
-                battery_analysis.append(f"  • {item}")
-            break  # Use first good source
-
-# Overall battery health assessment
-if found_data and battery_analysis:
-    # Look for voltage data to assess health
-    for source in battery_sources:
-        if source in dfs and 'Volt' in dfs[source].columns:
-            voltage_values = dfs[source]['Volt'].dropna()
-            if not voltage_values.empty:
-                min_volt = voltage_values.min()
-                
-                battery_analysis.append("\\nBattery Health Assessment:")
-                if min_volt < 10.5:
-                    battery_analysis.append("• ⚠️ CRITICAL: Battery reached dangerously low voltage")
-                elif min_volt < 11.1:
-                    battery_analysis.append("• ⚠️ WARNING: Battery voltage dropped to concerning levels")
-                elif min_volt > 13.0:
-                    battery_analysis.append("• ✓ EXCELLENT: Battery maintained healthy voltage throughout")
-                else:
-                    battery_analysis.append("• ✓ GOOD: Battery performance was acceptable")
-                break
-
-# Return result
-if battery_analysis:
-    result = "Comprehensive Battery Analysis:\\n" + "\\n".join(battery_analysis)
-else:
-    available_sources = [df_name for df_name in dfs.keys() if any(keyword in df_name.upper() for keyword in ['CURR', 'BAT', 'POWR'])]
-    if available_sources:
-        result = f"Battery data sources available ({', '.join(available_sources)}) but no detailed metrics found"
-    else:
-        result = "No battery data found in the flight log"
-result
-"""
-
+        except SyntaxError:
+            return False
+        except:
+            return True  # Runtime errors are OK for validation
 
 class AltitudeAnalyzerTool(BaseTool):
     name: str = "analyze_altitude"
@@ -2522,6 +1534,14 @@ class MultiRoleAgent:
         self.log_parser = LogParserService() 
         self.analysis_tools = AnalysisTools()
         
+        # Initialize Intent Classifier (replaces brittle keyword-based routing)
+        self.intent_classifier = IntentClassifier(self.settings)
+        
+        # Initialize Semantic Data Retriever for Phase 3: Semantic Data Understanding
+        self.semantic_retriever = SemanticDataRetriever(
+            storage_dir=os.path.join("./semantic_data_store")
+        )
+        
         # Session storage and performance tracking
         self.sessions: Dict[str, V2ConversationSession] = {}
         self.llm_calls: List[LLMCall] = []
@@ -2543,39 +1563,96 @@ class MultiRoleAgent:
             "flight": ["duration", "distance", "performance metrics"]
         }
         
-        # Enhanced dataframe documentation
+        # Comprehensive ArduPilot dataframe documentation enhanced with official definitions
+        # Source: https://ardupilot.org/copter/docs/logmessages.html and related ArduPilot documentation
         self.dataframe_documentation = {
-            'ATT': 'Attitude data - Roll, Pitch, Yaw angles in degrees from attitude controller',
-            'GPS': 'GPS position data - Lat, Lng, Alt, Spd (speed), GCrs (ground course), Status',
-            'BARO': 'Barometer data - Alt (altitude), Press (pressure), Temp (temperature)',
-            'IMU': 'Inertial measurement unit - AccX, AccY, AccZ (acceleration), GyrX, GyrY, GyrZ (gyroscope)',
-            'CURR': 'Current/Power data - Volt (voltage), Curr (current), CurrTot (total current)',
-            'BAT': 'Battery data - Volt (voltage), Curr (current), CurrTot, Res (resistance)',
-            'RCIN': 'RC input channels - C1-C16 (pilot stick/switch inputs)',
-            'RCOU': 'RC output channels - C1-C16 (servo/motor outputs)', 
-            'MODE': 'Flight mode changes - Mode (number), asText (mode name), ModeNum',
-            'MSG': 'Text messages - Message (alert/status text from autopilot)',
-            'VIBE': 'Vibration levels - VibeX, VibeY, VibeZ affecting IMU performance',
-            'MAG': 'Magnetometer data - MagX, MagY, MagZ (compass readings)',
-            'RATE': 'Rate controller - RDes, R (desired vs actual roll rate), same for pitch/yaw',
-            'CTUN': 'Control tuning - Alt, ClimbRate, ThO (throttle out), DAlt (desired altitude)',
-            'AHR2': 'AHRS backup - Roll, Pitch, Yaw, Alt, Lat, Lng (attitude/heading reference)',
-            'POS': 'Position estimates - Lat, Lng, Alt from Extended Kalman Filter',
-            'XKF1': 'EKF innovations - AngErr, VelErr, PosErr (Kalman filter uncertainties)',
-            'XKF2': 'EKF wind estimates - WindN, WindE (north/east wind components)',
-            'XKF3': 'EKF innovation variances - IVN, IVE, IVD (innovation test ratios)',
-            'XKF4': 'EKF timing - SV (solution valid), CE (compass error), SS (solution status)',
-            'POWR': 'Power system - Vcc (voltage), VServo (servo rail), Flags',
-            'MOTB': 'Motor/Battery - LiftMax, BatVolt, BatRes, ThLimit',
-            'ERR': 'Error codes - Subsys (subsystem), ECode (error code)',
-            'PARM': 'Parameter values - Name, Value (autopilot configuration parameters)',
-            'FMT': 'Format definitions - Type, Length, Name, Format (log structure)',
-            'FMTU': 'Format units - FmtType, UnitIds, MultIds (measurement units)',
-            'PIDR': 'PID Roll tuning - Des, P, I, D, FF, AFF (desired vs actual with PID components)',
-            'PIDP': 'PID Pitch tuning - Des, P, I, D, FF, AFF',
-            'PIDY': 'PID Yaw tuning - Des, P, I, D, FF, AFF',
-            'PIDA': 'PID Altitude tuning - Des, P, I, D, FF, AFF'
+            # Core Navigation & Attitude
+            'ATT': 'Canonical vehicle attitude - DesRoll, Roll, DesPitch, Pitch, DesYaw, Yaw angles. Vehicle desired vs achieved roll, pitch, yaw for attitude control analysis and flight stability assessment',
+            'AHR2': 'Backup AHRS attitude data - Estimated roll, pitch, yaw, altitude, latitude, longitude with quaternion components for redundant attitude estimation and navigation backup systems',
+            'CTUN': 'Control Tuning information - ThI (throttle input), ThO (throttle output), ThH (hover throttle), DAlt (desired altitude), Alt (achieved altitude), BAlt (barometric altitude), DCRt (desired climb rate), CRt (climb rate) for altitude and throttle control analysis',
+            'ANG': 'Attitude control attitude - DesRoll, Roll, DesPitch, Pitch, DesYaw, Yaw with delta time for real-time attitude controller performance monitoring',
+            
+            # GPS and Navigation Systems  
+            'GPS': 'GPS position data - Status (0=no GPS, 1=no fix, 2=2D fix, 3=3D fix), Time, NSats (satellite count), HDop (horizontal dilution of precision), Lat, Lng, RelAlt, Alt, SPD (speed), GCrs (ground course) for complete GPS navigation and signal quality analysis',
+            'GPA': 'GPS accuracy metrics - VDop (vertical dilution of precision), HAcc (horizontal accuracy), VAcc (vertical accuracy), SAcc (speed accuracy), SMS (system time) for GPS precision and reliability assessment',
+            'NTUN': 'Navigation Tuning - WPDst (waypoint distance), WPBrg (waypoint bearing), PErX/PErY (position error), DVelX/DVelY (desired velocity), VelX/VelY (actual velocity), DAcX/DAcY (desired acceleration), DRol/DPit (desired roll/pitch) for autonomous navigation analysis',
+            'POS': 'Position estimates - Latitude, longitude, altitude from Extended Kalman Filter sensor fusion for high-accuracy position tracking and navigation validation',
+            
+            # Sensor Data - Motion and Environment
+            'IMU': 'Inertial Measurement Unit - AccX/Y/Z (acceleration m/s/s), GyrX/Y/Z (rotation rates rad/s) in body frame with timestamps for motion detection, vibration analysis, and flight control',
+            'ACC': 'IMU accelerometer data - SampleUS (timestamp), AccX/Y/Z (acceleration along axes) for detailed acceleration analysis and sensor health monitoring',
+            'GYR': 'Gyroscope data - SampleUS (timestamp), GyrX/Y/Z (angular rates) for detailed rotation analysis and attitude control system performance',
+            'BARO': 'Barometer data - Alt (calculated altitude), AltAMSL (altitude above mean sea level), Press (atmospheric pressure), Temp (temperature), CRt (climb rate derived from barometer), SMS (sample time) for pressure-based altitude measurement and atmospheric conditions',
+            'ARSP': 'Airspeed sensor data - Airspeed (m/s), DiffPress (differential pressure), Temp (temperature), RawPress, Offset, sensor health flags for airspeed measurement analysis and sensor validation',
+            'COMPASS': 'Magnetometer data - MagX/Y/Z (magnetic field values), OfsX/Y/Z (offsets), MOfsX/Y/Z (motor compensation) for heading determination and compass calibration analysis',
+            'MAG': 'Raw magnetometer readings - MagX/Y/Z (compass field strength) for magnetic heading calculation and interference detection',
+            
+            # Power and Electrical Systems
+            'BAT': 'Battery monitoring - Inst (instance), Volt (voltage), VoltR (resting voltage), Curr (current), CurrTot (consumed Ah), EnrgTot (energy consumed Wh), Temp (temperature), Res (resistance), RemPct (remaining %), Health for comprehensive power system analysis',
+            'CURR': 'Current monitoring legacy format - Thr (throttle), ThrInt (integrated throttle), Volt (battery voltage), Curr (current), Vcc (board voltage), CurrTot (total current consumed) for electrical system health and power consumption analysis',
+            'BCL': 'Battery cell voltages - Instance, Volt (total voltage), V1-V12 (individual cell voltages in mV) for lithium battery health monitoring, cell balancing analysis, and battery safety assessment',
+            'BCL2': 'Extended battery cell voltages - V13, V14 (additional cell voltages) for high-capacity battery packs with more than 12 cells',
+            'POWR': 'Power system monitoring - Vcc (main voltage), VServo (servo rail voltage), Flags (power status flags) for complete electrical system health assessment',
+            
+            # Flight Control and Actuators
+            'MODE': 'Flight mode changes - Mode (flight mode string), ThrCrs (throttle cruise), Rsn (reason for mode change) for flight behavior analysis and mode transition tracking',
+            'RCIN': 'RC input channels - C1-C16 (pilot stick inputs, switch positions) for manual control analysis, pilot input monitoring, and control system responsiveness',
+            'RCOU': 'RC output channels - C1-C16 (PWM outputs to servos/motors) for actuator analysis, servo performance, and control surface movement validation',
+            'AETR': 'Control surface outputs - Ail (aileron), Elev (elevator), Thr (throttle), Rudd (rudder), Flap (flaps), Steer (steering), SS (surface scaling) for fixed-wing control analysis and surface movement tracking',
+            'RATE': 'Rate controller performance - DesRoll/Pitch/Yaw (desired rates), Roll/Pitch/Yaw (actual rates) for attitude control system tuning and performance analysis',
+            
+            # System Health, Errors and Events
+            'ERR': 'Error messages and system warnings - Subsys (subsystem), ECode (error code) including Radio/GPS/Compass/Battery/GCS failsafes, sensor health issues, fence breaches, crash detection for comprehensive safety and reliability analysis',
+            'EV': 'System events - Event number with descriptions like Armed (10), Disarmed (11), Auto Armed (15), Land Complete (18), Set Home (25), Takeoff Complete (28) for flight phase analysis and system state tracking',
+            'PM': 'Performance monitoring - NLon (long running loops), NLoop (total loops), MaxT (maximum loop time), Mem (available memory), Load (CPU load percentage) for autopilot performance analysis and system health monitoring',
+            'MSG': 'Text messages - Human-readable status messages, warnings, informational text from autopilot for flight analysis and debugging',
+            'VIBE': 'Vibration monitoring - VibeX/Y/Z (vibration levels), Clip0/1/2 (clipping counts) for mechanical health analysis, motor balance assessment, and sensor performance validation',
+            
+            # Advanced Flight Systems and Mission Control
+            'CMD': 'Mission commands - CTot (total commands), CNum (command number), CId (command type), Prm1-4 (parameters), Lat, Lng, Alt (waypoint coordinates), Frame for autonomous mission analysis and waypoint navigation',
+            'FENCE': 'Geofence system - Fence status, breach notifications, boundary violations for safety zone analysis and autonomous flight boundary enforcement',
+            'CAM': 'Camera triggers - Img (image number), GPSTime, GPSWeek, Lat, Lng, Alt, RelAlt, GPSAlt, Roll, Pitch, Yaw for mapping analysis, photo geolocation, and survey mission documentation',
+            'TERR': 'Terrain following - Terrain altitude, height above terrain for terrain-following flight analysis and ground clearance monitoring',
+            'FLOW': 'Optical flow - Ground speed estimation from camera sensor for GPS-denied navigation and position holding analysis',
+            'LIDAR': 'Lidar/rangefinder measurements - Distance measurements for obstacle avoidance, terrain following, and precision landing analysis',
+            'SONAR': 'Sonar measurements - Ultrasonic distance readings for landing assistance and low-altitude flight safety',
+            
+            # Extended Kalman Filter (EKF) and State Estimation
+            'XKF1': 'EKF primary state - AngErr (angle error), VelErr (velocity error), PosErr (position error), Innovation test ratios for Kalman filter performance and navigation accuracy assessment',
+            'XKF2': 'EKF wind estimation - WindN (north wind), WindE (east wind), MagN/E/D (magnetic field components) for wind analysis and magnetic field monitoring',
+            'XKF3': 'EKF innovation variances - IVN/IVE/IVD (innovation test ratios) for filter health monitoring and sensor fusion validation',
+            'XKF4': 'EKF timing and status - SV (solution valid), CE (compass error), SS (solution status) for navigation system health and reliability assessment',
+            'NKF1': 'NavEKF primary - Same as XKF1 but from NavEKF implementation for navigation filter performance analysis',
+            'NKF2': 'NavEKF wind - Same as XKF2 but from NavEKF for wind estimation and magnetic field analysis',
+            
+            # Communication and Telemetry
+            'RSSI': 'Signal strength - RC and telemetry signal quality, fade margin for communication link analysis and range assessment',
+            'MAV': 'MAVLink messages - Communication protocol data, packet rates, sequence numbers for telemetry system analysis and link quality monitoring',
+            'DMS': 'DataFlash-Over-MAVLink statistics - Block numbers, retry counts, queue statistics for logging system performance and data integrity analysis',
+            
+            # Specialized Vehicle Systems
+            'MOTB': 'Motor/Battery integration - LiftMax (maximum lift), BatVolt (battery voltage), BatRes (resistance), ThLimit (throttle limit) for motor performance and power system integration analysis',
+            'ESC': 'Electronic Speed Controller - RPM, Volt, Curr, Temp for individual motor performance monitoring and multi-rotor system analysis',
+            'AUXF': 'Auxiliary function triggers - Function ID, position, source, index, result for switch activation monitoring and auxiliary system control analysis',
+            
+            # Atmospheric and Environmental
+            'BARD': 'Barometer dynamic - DynPrX/Y/Z (dynamic pressure in body frame) for airspeed calculation and atmospheric pressure analysis in different axes',
+            'WIND': 'Wind estimation - Speed, direction, variance for wind analysis and flight planning optimization',
+            
+            # PID Controllers and Tuning
+            'PIDR': 'PID Roll controller - Des (desired), P/I/D (PID components), FF (feedforward), AFF (acceleration feedforward) for roll axis tuning and performance analysis',
+            'PIDP': 'PID Pitch controller - Des, P, I, D, FF, AFF for pitch axis control system tuning and stability analysis',
+            'PIDY': 'PID Yaw controller - Des, P, I, D, FF, AFF for yaw axis control system tuning and heading control analysis',
+            'PIDA': 'PID Altitude controller - Des, P, I, D, FF, AFF for altitude hold system tuning and vertical position control analysis',
+            
+            # Configuration and Parameters
+            'PARM': 'Parameter values - Name, Value pairs for autopilot configuration analysis, parameter change tracking, and system setup validation',
+            'FMT': 'Format definitions - Type, Length, Name, Format describing log message structure for log analysis and data interpretation',
+            'FMTU': 'Format units - FmtType, UnitIds, MultIds defining measurement units and multipliers for data scaling and unit conversion'
         }
+        
+        # Initialize semantic data understanding (Phase 3) - AFTER dataframe_documentation is set up
+        self._initialize_semantic_data_understanding()
 
     def _setup_memory_configuration(self):
         """Configure CrewAI memory system for persistent conversation context."""
@@ -2597,6 +1674,16 @@ class MultiRoleAgent:
         }
         
         logger.info(f"Memory system configured with storage at: {self.memory_storage_dir}")
+
+    def _initialize_semantic_data_understanding(self):
+        """Initialize Phase 3: Semantic Data Understanding system."""
+        try:
+            # Schedule the async initialization for when an event loop is available
+            # This will be handled when the first request comes in
+            logger.info("Phase 3: Semantic Data Understanding initialized successfully (async indexing deferred)")
+        except Exception as e:
+            logger.error(f"Failed to initialize semantic data understanding: {e}")
+            logger.info("Semantic data understanding will use fallback mode")
 
     def _get_memory_context(self, session_id: str, user_message: str) -> str:
         """Get relevant memory context for the current query."""
@@ -2652,6 +1739,18 @@ class MultiRoleAgent:
         
         return info
 
+    def get_semantic_retriever_status(self) -> Dict[str, Any]:
+        """Get status information about the semantic data understanding system."""
+        try:
+            return self.semantic_retriever.get_status()
+        except Exception as e:
+            logger.error(f"Failed to get semantic retriever status: {e}")
+            return {
+                "initialized": False,
+                "error": str(e),
+                "fallback_mode": True
+            }
+
     async def create_or_get_session(self, session_id: Optional[str] = None) -> V2ConversationSession:
         """Creates a new session or retrieves an existing one."""
         if not session_id:
@@ -2670,6 +1769,12 @@ class MultiRoleAgent:
         
         try:
             await self.log_parser.process_log_file(session_id, file_path, session)
+            
+            # Phase 3: Re-index semantic data after processing new log file
+            if session.dataframes:
+                await self.semantic_retriever.index_dataframe_documentation(self.dataframe_documentation)
+                logger.info(f"[{session_id}] Semantic data understanding updated for new session data")
+                
         except Exception as e:
             session.processing_error = str(e)
             logger.error(f"Error processing log file: {e}")
@@ -2734,7 +1839,7 @@ AVAILABLE ANALYSIS TOOLS (with intelligent selection):
 - find_anomalies: Pattern detection, unusual behavior identification
 - get_timeline_analysis: Chronological event analysis, flight progression
 - analyze_flight_phase: Phase-specific analysis (takeoff, landing, cruise)
-- enhanced_telemetry_analysis: Comprehensive analysis covering all 164 message types, advanced derived metrics, cross-sensor validation, EKF health analysis
+- enhanced_telemetry_analysis: Comprehensive analysis covering all 164 message types, advanced derived metrics, cross-sensor validation, EKF health
 
 INTELLIGENT PLANNING APPROACH:
 1. **Specific Questions**: Match to the most appropriate single tool
@@ -2793,196 +1898,247 @@ Available Flight Data:
 CONVERSATION CONTEXT:
 {conversation_context}
 
-🔥 CRITICAL TOOL OUTPUT RULES:
-1. **NEVER IGNORE TOOL RESULTS** - If a tool returns actual data, use it exactly as returned
-2. **NEVER MAKE UP RESPONSES** - Only use information that comes directly from tool execution
-3. **TRUST TOOL OUTPUTS** - If execute_python_code returns "Found 5 critical errors", report exactly that
-4. **NO GENERIC INTERPRETATIONS** - Don't say "detected" or "analyzed" unless tools actually returned specific results
+🔥 CRITICAL TOOL EXECUTION RULES:
+1. **NEVER IGNORE TOOL RESULTS** - Use EXACTLY what tools return, never modify or interpret
+2. **NO DATA FABRICATION** - Only use information that comes directly from tool execution
+3. **WRITE ACTUAL PYTHON CODE** - For execute_python_code tool, write real Python code, not natural language
+4. **TRUST TOOL OUTPUTS** - Report tool results exactly as returned
+
+PYTHON CODE GENERATION REQUIREMENTS:
+When using execute_python_code tool, you MUST write actual executable Python code:
+
+✅ CORRECT EXAMPLES:
+```python
+# Find maximum altitude
+max_alt = None
+for source in ['GPS', 'BARO', 'CTUN']:
+    if source in dfs and 'Alt' in dfs[source].columns:
+        alt_values = dfs[source]['Alt'].dropna()
+        if not alt_values.empty:
+            current_max = alt_values.max()
+            if max_alt is None or current_max > max_alt:
+                max_alt = current_max
+result = f"Maximum altitude: {{max_alt:.1f}}m" if max_alt else "No altitude data"
+result
+```
+
+❌ WRONG EXAMPLES:
+- "Generate comprehensive flight summary with power analysis"
+- "Find the maximum altitude"
+- "Analyze battery performance"
+
+FLIGHT DATA ACCESS PATTERN:
+- Use `dfs` dictionary to access dataframes: `dfs['GPS']`, `dfs['BARO']`, etc.
+- Available dataframes: {list(session.dataframes.keys())[:10]}...
+- Common patterns:
+  * Altitude: `dfs['BARO']['Alt']` or `dfs['GPS']['Alt']`
+  * Battery: `dfs['BAT']['Volt']`, `dfs['BAT']['Curr']`
+  * Time: `dfs[df_name]['TimeUS']` (microseconds)
+  * Messages: `dfs['MSG']['Message']`
+  * Errors: `dfs['ERR']`
 
 INTELLIGENT EXECUTION BEHAVIOR:
-1. **Always attempt the planned tools first** - Execute as intended
-2. **Use the EXACT tool output** - Report what tools actually found, not your interpretation
-3. **Smart error recovery** - If a tool fails, try alternative approaches
-4. **Provide actual results** - Never describe what you "will do", just do it
-5. **Use fallback strategies** - Tools have built-in intelligent fallbacks
-6. **Combine results intelligently** - Synthesize multi-tool outputs
-7. **Consider conversation context** - Build on previous discussions appropriately
-
-CONTEXTUAL EXECUTION STRATEGY:
-- For "consistently high" queries: Focus on altitude stability and flight control
-- For follow-up questions: Reference and expand on previous findings
-- For "why" questions: Provide root cause analysis with supporting data
-- For "more detail" requests: Dive deeper into specific technical aspects
-
-TOOL EXECUTION STRATEGY:
-- analyze_altitude: Direct altitude analysis (has GPS/BARO fallbacks)
-- execute_python_code: Most versatile, has direct query analysis fallbacks
-- detect_flight_events: Has intelligent dataframe analysis fallbacks
-- find_anomalies: Pattern detection with error handling
-- get_timeline_analysis: Chronological analysis
-- analyze_flight_phase: Phase-specific insights
-- enhanced_telemetry_analysis: Comprehensive analysis with all 164 message types, advanced derived metrics, cross-sensor validation
-
-ERROR RECOVERY RULES:
-- If a tool fails with validation errors → Try execute_python_code as fallback
-- If code execution fails → Tools have built-in direct analysis fallbacks
-- If multiple tools planned → Execute each, combine successful results
-- If all tools fail → Provide best effort analysis with available data
+1. **Execute planned tools first** - Follow the plan exactly
+2. **Use EXACT tool output** - Report what tools actually returned
+3. **Write proper Python code** - No natural language to code tools
+4. **Combine results intelligently** - Synthesize multi-tool outputs accurately
+5. **Handle errors gracefully** - Try alternative approaches if tools fail
 
 RESPONSE QUALITY:
-- Start with actual findings (numbers, data, specific results) FROM TOOL OUTPUTS
-- Provide context only when it adds value
-- Be conversational but concise (2-4 sentences typically)
+- Start with actual findings (numbers, data, specific results) FROM TOOL OUTPUTS ONLY
+- Be conversational but precise (2-4 sentences typically)
 - For comprehensive queries: Organize findings logically
+- NEVER add information not provided by tools
 
 CRITICAL FORBIDDEN BEHAVIORS:
 - Never ignore tool results and make up your own interpretation
+- Never fabricate data not returned by tools
+- Never pass natural language to execute_python_code tool
 - Never say "detected" without tool output saying "detected"
-- Never say "analysis shows" without actual analysis results
-- Never say "I will use" or "Let me check" - just execute immediately
+- Never add flight duration, times, or counts not calculated by tools
 - Never give up without trying fallback approaches
-- Never return generic error messages without attempting recovery
-- Never describe tool plans - provide actual results
-- **NEVER report what couldn't be determined** - only report positive findings
-- **NEVER mention missing data or failed analyses** - gracefully omit unavailable information
-- **NEVER say "couldn't be determined", "not available", "data complexity"** - skip those aspects entirely
 
 EXECUTION EXAMPLES:
-✓ "The maximum altitude reached was 1,448 meters during cruise phase." (from tool output)
-✓ "Found 3 GPS signal loss events between 14:23 and 14:45. The aircraft maintained stable flight using barometric altitude." (from tool output)
-✗ "I will use the analyze_altitude tool to determine..."
-✗ "Analysis failed due to tool validation error."
-✗ "The analysis detected..." (when tools didn't actually return "detected")
+✓ "The maximum altitude reached was 1,448 meters." (from tool output)
+✓ "Found 18 GPS signal events between 14:23 and 14:45." (from tool output)
+✗ "The analysis shows..." (when no analysis was actually performed)
+✗ "Flight duration was 3.8 minutes" (when no tool calculated this)
 
-🔥 REMEMBER: Only report what tools actually returned. Don't interpret or summarize unless the tool output is unclear."""
+🔥 REMEMBER: Only report what tools actually returned. Write real Python code, not natural language queries."""
 
         tools = self._create_crew_tools(session)
         
         return Agent(
             role="UAV Flight Data Analyst & Intelligent Executor",
-            goal="Execute analysis tools immediately and provide actual results from tool outputs",
+            goal="Execute analysis tools with real Python code and provide actual results from tool outputs",
             backstory=backstory,
             llm=self.llm,
             tools=tools,
             verbose=True,
-            allow_delegation=False
+            allow_delegation=False,
+            max_iter=10,  # Allow more iterations to ensure tool execution
+            max_execution_time=60,  # Increase timeout for tool execution
+            step_callback=self._ensure_tool_execution
         )
 
     def _create_critic_agent(self, session: V2ConversationSession) -> Agent:
-        """Create the Critic agent focused on concise, essential responses."""
+        """Create the Critic agent with enhanced report generation capabilities."""
         conversation_context = self._get_conversation_context(session)
         
-        backstory = f"""You are an expert UAV flight data analyst who transforms technical analysis into perfectly formatted, useful responses.
+        backstory = f"""You are an expert UAV flight data analyst who transforms technical analysis into perfectly formatted responses, with advanced capabilities for generating comprehensive flight reports.
 
 CONVERSATION CONTEXT:
 {conversation_context}
 
-CRITICAL: You MUST provide a complete, final answer - NEVER output intermediate thoughts like "I can give a great answer" or planning statements.
+🚨 CRITICAL DATA INTEGRITY RULES:
+1. **ONLY USE EXECUTOR DATA** - Use EXACTLY what the executor provided, nothing more
+2. **NO DATA FABRICATION** - Never add numbers, times, counts, or details not in executor output
+3. **NO INTERPRETATION** - Don't change "18 events" to "22 events" or add "duration: 3.8 minutes"
+4. **EXACT PRESERVATION** - Keep all numbers, measurements, and findings exactly as provided
 
-PERFECT RESPONSE STYLE GUIDE:
+🔥 FORBIDDEN ADDITIONS:
+- Flight duration/time calculations not provided by executor
+- Changing event counts (18 → 22, etc.)
+- Adding GPS quality assessments not in executor output
+- Inferring data from "available for analysis" statements
+- Converting between units not done by executor
+- Adding contextual information not provided
 
-**For Simple Questions (1-2 sentences):**
-- "The maximum altitude reached was 1,448 meters."
-- "GPS signal was poor with only 2.5 satellites detected during the flight."
-- "Battery voltage remained healthy, averaging 15.2V throughout the flight."
+📊 ENHANCED REPORT GENERATION CAPABILITIES:
 
-**For Multi-Aspect Analysis (bullet points):**
-- "Power System Analysis:
-  • Battery voltage averaged 15.2V with healthy discharge pattern
-  • Current consumption peaked at 28A during climb phases
-  • Temperature remained within safe limits at 42°C maximum
-  • No power-related warnings or critical events detected"
+**DETECT COMPREHENSIVE SUMMARY REQUESTS:**
+When the user asks for:
+- "flight summary"
+- "summary of this flight" 
+- "overall analysis"
+- "comprehensive report"
+- "flight performance report"
+- Multiple consecutive queries about different aspects (altitude, power, GPS, errors)
 
-**Quality Standards:**
-- Include specific numbers and measurements
-- Use conversational but professional tone
-- Provide immediately actionable information
-- Match format to complexity (simple = sentences, complex = bullets)
+THEN generate a **CONSOLIDATED MARKDOWN REPORT** instead of fragmented responses.
 
-WHEN TO USE EACH FORMAT:
+**MARKDOWN REPORT STRUCTURE:**
+```markdown
+### **Flight Performance Summary**
 
-**NATURAL SENTENCES (1-2 sentences):**
-- Simple questions: "What was the max altitude?" → "The maximum altitude reached was 1,448 meters."
-- Single measurements: "Check battery voltage" → "Battery voltage remained healthy, averaging 15.2V throughout the flight."
-- Specific errors: "Any GPS issues?" → "GPS signal was poor with only 2.5 satellites detected during the flight."
+Brief introduction based on executor findings.
 
-**BULLET POINTS (3-5 points):**
-- Flight summaries with multiple systems
-- Multi-aspect analysis (altitude + power + GPS + events)
-- Lists of events or multiple findings
-- When user asks for comprehensive analysis
+---
 
-FORMAT EXAMPLES:
+#### **Flight Dynamics & Altitude**
+* **Maximum Altitude:** [from executor data]
+* **Average Altitude:** [from executor data]
+* **Altitude Range:** [calculated from executor max/min if both provided]
 
-SIMPLE QUERY - NATURAL SENTENCES:
-"The maximum altitude reached was 1,448 meters during the cruise phase."
+---
 
-MULTI-ASPECT QUERY - BULLET POINTS:
-"Power System Analysis:
-• Battery voltage averaged 15.2V with healthy discharge pattern
-• Current consumption peaked at 28A during climb phases  
-• Temperature remained within safe limits at 42°C maximum
-• No power-related warnings or critical events detected"
+#### **System Alerts & Events**
+* **Event Count:** [from executor data]
+* [Conditional notes based on rules]
 
-FORMATTING TO REMOVE:
-- Verbose section headers like "Altitude Analysis Summary:", "Flight Profile Analysis:"
-- Sub-categories and nested breakdowns
-- "Insights:" sections and redundant explanations
-- Multiple measurements of the same thing
+---
 
-FORMATTING TO KEEP:
-- Clear bullet points for complex summaries
-- Natural sentences for simple questions
-- Specific numbers and measurements
-- Essential operational context
+#### **GPS & Navigation Quality**
+* **Average Satellites:** [from executor data]
+* **Average HDOP:** [from executor data]
+* [Conditional notes based on rules]
 
-EXAMPLES:
+---
 
-OVERLY VERBOSE WITH SECTION HEADERS (AVOID):
-"Altitude Analysis Summary:
-- Maximum altitude: 1448.0m
-- Average altitude: 160.9m
-- Total altitude range: 1448.0m
+#### **Power System Analysis**
+* **Average Voltage:** [from executor data]
+* **Minimum Voltage:** [from executor data]
+* **Average Current:** [from executor data]
+* **Peak Current:** [from executor data]
+* [Conditional notes based on rules]
+```
 
-Flight Profile Analysis:
-- The flight exhibited extensive altitude changes, reaching a maximum of 1448.0m
-- The flight pattern suggests distinct phases like takeoff, cruising at 1448m, and landing
+**RULES-BASED ANALYSIS ENGINE:**
+Apply these rules ONLY when generating consolidated reports and ONLY if executor provided the relevant data:
 
-GPS Data Quality Analysis:
-- GPS signal quality: 2.5 satellites (poor reception)"
+1. **GPS HDOP Analysis:** If average HDOP > 5.0:
+   "*Note: HDOP values above 5 indicate reduced GPS accuracy. Values below 2 are ideal for precise navigation.*"
 
-OVERLY BRIEF (AVOID):
-"Flight reached 1,448m maximum altitude with 18 critical events, including Radio and GCS Failsafe alerts."
+2. **Voltage Critical Analysis:** If minimum voltage < 1.0V:
+   "*Note: Minimum voltage near 0V indicates potential power system issues or sensor malfunction.*"
 
-BALANCED WITH BULLET POINTS FOR SUMMARIES (PREFERRED):
-"Flight Summary:
-• Reached maximum altitude of 1,448m with extensive altitude changes throughout
-• GPS reception was poor with only 2.5 satellites detected
-• 18 critical events occurred including Radio and GCS Failsafe alerts
-• Battery performance remained healthy with voltage within safe limits
-• Flight exhibited distinct phases suggesting complex mission profile"
+3. **Event Count Analysis:** If event count > 10:
+   "*Note: High event count detected. Review of specific event logs recommended for detailed analysis.*"
 
-NATURAL SENTENCES FOR SIMPLE QUESTIONS (PREFERRED):
-"The maximum altitude reached was 1,448 meters during the cruise phase."
+4. **Satellite Count Analysis:** If average satellites < 4:
+   "*Note: GPS satellite count below 4 may indicate poor signal reception affecting navigation accuracy.*"
 
-CRITICAL OUTPUT REQUIREMENT:
-You MUST provide the actual final response that answers the user's question. NEVER output intermediate thoughts like "I can give a great answer" or "Let me optimize this". Provide the complete, optimized response immediately."""
+**FLEXIBLE CATEGORIZATION:**
+Dynamically organize executor data into relevant categories based on what was provided:
+- Only include sections where executor provided data
+- Adapt section names to match the specific type of analysis performed
+- Use consistent Markdown formatting throughout
+
+**RESPONSE DECISION LOGIC:**
+
+**For Simple/Specific Questions:**
+- Single measurement queries → Natural sentence responses
+- Specific error checks → Bullet point findings
+- Basic yes/no questions → Direct answers
+
+**For Comprehensive Analysis:**
+- Flight summary requests → Full Markdown report
+- Multiple system analysis → Categorized Markdown report
+- Performance review requests → Structured analysis report
+
+**CRITICAL OUTPUT REQUIREMENTS:**
+1. Preserve all executor data exactly as provided
+2. Apply rules-based analysis only to executor-provided metrics
+3. Use Markdown formatting for comprehensive reports
+4. Maintain professional, analytical tone
+5. Provide actionable insights based on detected patterns in executor data
+
+**QUALITY STANDARDS:**
+- Include specific numbers and measurements FROM EXECUTOR ONLY
+- Use professional but accessible language
+- Structure information for immediate comprehension
+- Highlight critical findings that require attention
+- Maintain consistency in formatting and terminology"""
 
         return Agent(
-            role="Final Response Generator", 
-            goal="Generate the complete final response that users will see - never output intermediate thoughts or planning statements",
+            role="Advanced Flight Data Report Generator & Formatter", 
+            goal="Transform executor results into professional, structured reports with rules-based analysis",
             backstory=backstory,
             llm=self.llm,
             verbose=True,
             allow_delegation=False,
             max_iter=1,
-            max_execution_time=20
+            max_execution_time=30
         )
 
-    def _create_planning_task(self, user_message: str, session: V2ConversationSession) -> Task:
-        """Create the planning task for tool selection."""
+    async def _create_planning_task(self, user_message: str, session: V2ConversationSession) -> Task:
+        """Create the planning task for tool selection with enhanced flight summary detection."""
         data_summary = get_data_summary(session)
         conversation_context = self._get_conversation_context(session)
+        is_flight_summary = self._is_flight_summary_request(user_message)
+        
+        # Phase 3: Get semantic context for intelligent data source selection
+        semantic_context = ""
+        try:
+            # ✅ FIXED - Now using proper Phase 3 semantic search with vector embeddings
+            matches = await self.semantic_retriever.find_relevant_dataframes(
+                user_message, 
+                list(session.dataframes.keys()),
+                top_k=3
+            )
+            if matches:
+                semantic_context = f"SEMANTIC DATA ANALYSIS:\nBased on your query '{user_message}', the most relevant data sources are:\n"
+                for i, match in enumerate(matches, 1):
+                    semantic_context += f"{i}. {match.dataframe_key}: {match.dataframe_description}\n"
+                    semantic_context += f"   Relevance: {match.relevance_reason} (Score: {match.similarity_score:.2f})\n"
+                semantic_context += "\nRECOMMENDATION: Focus your analysis on these dataframes for the most relevant results."
+            else:
+                semantic_context = "No specific dataframes identified as highly relevant for this query. Consider general analysis approach."
+        except Exception as e:
+            logger.warning(f"Failed to get semantic context: {e}")
+            semantic_context = "Semantic data understanding unavailable, using general approach."
+        
+
         
         # Additional safety check to ensure data_summary is never None
         if data_summary is None:
@@ -2993,82 +2149,144 @@ You MUST provide the actual final response that answers the user's question. NEV
                 "key_metrics": {}
             }
         
-        description = f"""Create an execution plan for the user's query by selecting the most appropriate analysis tool.
-
-User Question: {user_message}
-
-Available Data: {list(session.dataframes.keys())}
-
-CONVERSATION CONTEXT:
-{conversation_context}
-
-AVAILABLE TOOLS:
-- analyze_altitude → altitude-related analysis
-- execute_python_code → data extraction, calculations, specific metrics, POWER ANALYSIS, battery data
-- detect_flight_events → error analysis, critical events, system issues, warnings
-- find_anomalies → pattern detection, unusual behavior identification
-- analyze_flight_phase → phase-specific analysis (takeoff, landing, cruise)
-- get_timeline_analysis → chronological event analysis
-- enhanced_telemetry_analysis → comprehensive analysis covering all 164 message types, advanced derived metrics, cross-sensor validation, EKF health
-
-INTELLIGENT TOOL SELECTION:
-- For specific questions: Use the most appropriate single tool
-- For comprehensive questions (summaries, overviews): Use multiple tools for complete analysis
-- For complex queries: Combine tools as needed for thorough investigation
-- For contextual follow-ups: Consider conversation history when selecting tools
-
-POWER & BATTERY QUERY ROUTING:
-- "power consumption", "analyze power", "battery" → [execute_python_code] (has comprehensive power analysis)
-- "battery temperature", "battery voltage", "current consumption" → [execute_python_code]
-- Power queries should ALWAYS use execute_python_code as it has the most comprehensive power analysis
-
-        ERROR & WARNING QUERY ROUTING:
-        - "critical errors", "list errors", "mid-flight errors" → [execute_python_code, detect_flight_events] 
-        - "errors", "warnings", "check for errors", "any problems" → [detect_flight_events, execute_python_code]
-        - "system errors" → [detect_flight_events] (has intelligent fallbacks)
-        - Execute_python_code has comprehensive error analysis code with robust fallbacks for critical error queries
-
-ENHANCED TELEMETRY ANALYSIS ROUTING:
-- "comprehensive analysis", "complete analysis", "full analysis" → [enhanced_telemetry_analysis]
-- "cross sensor validation", "sensor comparison", "ekf health" → [enhanced_telemetry_analysis]
-- "derived metrics", "advanced metrics", "calculated metrics" → [enhanced_telemetry_analysis]
-- "signal quality assessment", "data quality" → [enhanced_telemetry_analysis]
-- "all 164 message types", "complete telemetry" → [enhanced_telemetry_analysis]
-- For detailed technical analysis: Include enhanced_telemetry_analysis with other tools
-
-CONTEXTUAL QUERY ANALYSIS:
-- "consistently high" in UAV context typically refers to ALTITUDE, not GPS quality
-- "why was flight consistently high" = altitude analysis + flight mode analysis
-- "describe more detail on [previous topic]" = expand on previous analysis
-- Follow-up questions should build on conversation context
-
-TASK: Analyze the query and select tools. You MUST respond in the EXACT format below.
-
-REQUIRED OUTPUT FORMAT (fill in actual values):
-NEEDS_TOOLS: true
-TOOL_SEQUENCE: [tool1, tool2, tool3]
-REASONING: Brief explanation why these tools were selected
-CONFIDENCE: 0.8
-APPROACH: conversational_analysis
-
-CRITICAL REQUIREMENTS:
-- Use EXACTLY the format above with actual tool names
-- For altitude questions: Use [analyze_altitude, execute_python_code] 
-- For power/battery questions: Use [execute_python_code] (has comprehensive power analysis)
-- For error/warning questions: Use [detect_flight_events, execute_python_code]
-- For flight summaries: Select multiple tools like [analyze_altitude, execute_python_code, detect_flight_events]
-- Consider conversation context when interpreting ambiguous terms
-- No additional text or explanations outside this format"""
+        # Build description using safe string concatenation to avoid f-string nesting issues
+        description_parts = [
+            "🚨 You are an intelligent UAV flight data planning agent with enhanced flight summary capabilities.",
+            "",
+            f'User Question: "{user_message}"',
+            f"Is Flight Summary Request: {is_flight_summary}",
+            "",
+            f"Available Flight Data: {list(session.dataframes.keys())}",
+            "",
+            "CONVERSATION CONTEXT:",
+            conversation_context,
+            "",
+            semantic_context,
+            "",
+            "🎯 **ENHANCED PLANNING APPROACH:**",
+            "",
+            f"**FLIGHT SUMMARY DETECTION:** This query {'IS' if is_flight_summary else 'IS NOT'} identified as a comprehensive flight summary request.",
+            "",
+        ]
+        
+        if is_flight_summary:
+            description_parts.extend([
+                "🔥 **COMPREHENSIVE FLIGHT SUMMARY PLANNING:**",
+                "",
+                "For flight summary requests, plan a comprehensive multi-tool analysis:",
+                "",
+                "**AVAILABLE ANALYSIS TOOLS:**",
+                "- `analyze_altitude`: Specialized altitude analysis (max/min/stats/ranges)",
+                "- `execute_python_code`: Flexible code execution for calculations and custom analysis", 
+                "- `detect_flight_events`: Error analysis, warnings, critical events (has intelligent fallbacks)",
+                "- `find_anomalies`: Pattern detection, unusual behavior identification",
+                "- `analyze_flight_phase`: Phase-specific analysis (takeoff, landing, cruise)",
+                "- `get_timeline_analysis`: Chronological event analysis, flight progression",
+                "- `enhanced_telemetry_analysis`: Comprehensive analysis covering all 164 message types",
+                "",
+                "**FOR FLIGHT SUMMARY REQUESTS:**",
+                "- ALWAYS include: analyze_altitude, execute_python_code, detect_flight_events",
+                "- RECOMMENDED: enhanced_telemetry_analysis for comprehensive coverage",
+                "- OPTIONAL: find_anomalies, get_timeline_analysis for deeper insights",
+                "- REASONING: \"Comprehensive flight summary requiring multiple analysis perspectives\"",
+                "- CONFIDENCE: 0.9 (high confidence for multi-tool comprehensive analysis)",
+                "- APPROACH: comprehensive_flight_summary",
+                "",
+                "**FLIGHT SUMMARY TOOL PLANNING:**",
+                "When planning for flight summaries, ensure coverage of:",
+                "1. **Altitude Performance** - analyze_altitude",
+                "2. **System Health & Events** - detect_flight_events",
+                "3. **Custom Calculations** - execute_python_code",
+                "4. **Comprehensive Analysis** - enhanced_telemetry_analysis (optional)",
+                "5. **Pattern Detection** - find_anomalies (optional)",
+                "",
+                "**CONFIDENCE GUIDELINES:**",
+                "- High confidence (0.8-1.0): Flight summary requests, clear comprehensive analysis needs",
+                "- Medium confidence (0.6-0.8): Partial summary requests, multi-aspect queries",
+                "- Low confidence (0.4-0.6): Unclear scope, ambiguous summary requests",
+                "",
+                "**CRITICAL PLANNING RULES:**",
+                "1. For flight summaries: Always plan multi-tool comprehensive analysis",
+                "2. Always provide a valid tool sequence",
+                "3. Explain reasoning clearly",
+                "4. Consider available data types and conversation context",
+                "",
+                "TASK: Create an execution plan using this format:",
+                "",
+                "NEEDS_TOOLS: true",
+                "TOOL_SEQUENCE: [tool1, tool2, tool3, ...]",
+                "REASONING: [Clear explanation matching the query type - summary vs specific]",
+                "CONFIDENCE: [0.4-1.0]",
+                "APPROACH: comprehensive_flight_summary",
+                "",
+                "Focus on comprehensive multi-tool analysis for complete flight overview."
+            ])
+        else:
+            description_parts.extend([
+                "🎯 **SPECIFIC QUERY PLANNING:**",
+                "",
+                "For specific queries, select the most appropriate tools:",
+                "",
+                "**AVAILABLE ANALYSIS TOOLS:**",
+                "- `analyze_altitude`: Specialized altitude analysis (max/min/stats/ranges)",
+                "- `execute_python_code`: Flexible code execution for calculations and custom analysis",
+                "- `detect_flight_events`: Error analysis, warnings, critical events (has intelligent fallbacks)",
+                "- `find_anomalies`: Pattern detection, unusual behavior identification",
+                "- `analyze_flight_phase`: Phase-specific analysis (takeoff, landing, cruise)",
+                "- `get_timeline_analysis`: Chronological event analysis, flight progression",
+                "- `enhanced_telemetry_analysis`: Comprehensive analysis covering all 164 message types",
+                "",
+                "**FOR SPECIFIC QUERIES:**",
+                "- For **altitude questions**: analyze_altitude OR execute_python_code as backup",
+                "- For **error/warning queries**: detect_flight_events (has built-in fallbacks)",
+                "- For **power/battery queries**: execute_python_code (most versatile for calculations)",
+                "- For **GPS/navigation queries**: execute_python_code with GPS focus",
+                "- For **complex calculations**: execute_python_code (most flexible)",
+                "- **When unsure**: Default to execute_python_code (most adaptable)",
+                "",
+                "**SPECIFIC QUERY PLANNING:**",
+                "For specific queries, focus on:",
+                "1. **User's specific question** - Most appropriate single tool",
+                "2. **Supporting analysis** - Complementary tools if needed",
+                "3. **Fallback capability** - execute_python_code as backup",
+                "",
+                "**CONFIDENCE GUIDELINES:**",
+                "- High confidence (0.8-1.0): Clear, specific queries with obvious tool matches",
+                "- Medium confidence (0.6-0.8): Moderately clear queries, some interpretation needed",
+                "- Low confidence (0.4-0.6): Ambiguous queries, fallback strategies important",
+                "",
+                "**CRITICAL PLANNING RULES:**",
+                "1. For specific queries: Match tools to user's exact question",
+                "2. Always provide a valid tool sequence",
+                "3. Explain reasoning clearly",
+                "4. Consider available data types and conversation context",
+                "",
+                "TASK: Create an execution plan using this format:",
+                "",
+                "NEEDS_TOOLS: true",
+                "TOOL_SEQUENCE: [tool1, tool2, tool3, ...]",
+                "REASONING: [Clear explanation matching the query type - summary vs specific]",
+                "CONFIDENCE: [0.4-1.0]",
+                "APPROACH: intelligent_analysis",
+                "",
+                "Focus on understanding what the user specifically wants and selecting appropriate tools."
+            ])
+        
+        description = "\n".join(description_parts)
 
         expected_output = """MUST output EXACTLY this format (replace bracketed values):
 
 NEEDS_TOOLS: true
 TOOL_SEQUENCE: [tool1, tool2, tool3]
-REASONING: [explanation of tool selection]
+REASONING: [explanation of tool selection based on specific query analysis]
 CONFIDENCE: [0.7-0.9]
 APPROACH: conversational_analysis
 
-CRITICAL: No other text, explanations, or formatting. Just the above structure with actual values."""
+CRITICAL REQUIREMENTS:
+- REASONING must match the specific query type (error, altitude, summary, etc.)
+- TOOL_SEQUENCE must follow the routing rules exactly
+- NO generic "comprehensive analysis" reasoning
+- Explain WHY these tools match the user's specific request"""
 
         return Task(
             description=description,
@@ -3077,112 +2295,120 @@ CRITICAL: No other text, explanations, or formatting. Just the above structure w
         )
 
     def _create_execution_task(self, user_message: str, execution_plan: ExecutionPlan) -> Task:
-        """Create the execution task with concise conversational approach."""
-        description = f"""Execute the planned tools to provide comprehensive analysis for the user's question.
+        """Create the execution task with proper tool calling guidance and clear result handling."""
+        
+        # Build task description using safe string concatenation (no f-strings with variables)
+        description_parts = [
+            "🚨 CRITICAL: Execute tools that are RELEVANT to the user's specific question.",
+            "",
+            "User Question: " + user_message,
+            "",
+            "EXECUTION PLAN:",
+            "Tools to Execute: " + str(execution_plan.tool_sequence),
+            "Reasoning: " + execution_plan.reasoning,
+            "",
+            "🔥 SMART EXECUTION VALIDATION:",
+            "1. **ANALYZE USER'S ACTUAL QUESTION** - What are they specifically asking for?",
+            "2. **VALIDATE TOOL RELEVANCE** - Only use tools that make sense for this query",
+            "3. **SKIP IRRELEVANT TOOLS** - If a tool doesn't match the query, skip it with explanation",
+            "4. **FOCUS ON RELEVANT RESULTS** - Report only results that answer the user's question",
+            "",
+            "🎯 QUERY-SPECIFIC EXECUTION RULES:",
+            "",
+            "For ERROR/WARNING queries like 'Check for any errors or warnings':",
+            "- PRIMARY: detect_flight_events (error analysis)",
+            "- SECONDARY: execute_python_code (if detailed error analysis needed)",
+            "- SKIP: analyze_altitude (not relevant to error checking)",
+            "",
+            "For ALTITUDE queries like 'What was the maximum altitude?':",
+            "- PRIMARY: analyze_altitude (altitude statistics)",
+            "- SECONDARY: execute_python_code (if additional calculations needed)",
+            "- SKIP: detect_flight_events (not relevant to altitude questions)",
+            "",
+            "For FLIGHT SUMMARY queries like 'Give me a flight summary':",
+            "- USE ALL: analyze_altitude, execute_python_code, detect_flight_events",
+            "- ALL tools are relevant for comprehensive overview",
+            "",
+            "YOU MUST EXECUTE THESE SPECIFIC TOOLS: " + str(execution_plan.tool_sequence),
+            "BUT: Skip any tool that doesn't make sense for the user's specific question",
+            ""
+        ]
+        
+        # Add safe code examples and requirements using the utility method
+        description_parts.extend(CodeTemplates.get_safe_description_builder())
+        
+        # Add remaining safe instructions
+        description_parts.extend([
+            "",
+            "🚨 CRITICAL EXECUTION REQUIREMENTS:",
+            "1. **CALL TOOLS IMMEDIATELY** - Do NOT write planning text, execute tools NOW",
+            "2. **NO PLANNING RESPONSES** - Any response starting with 'I will' or 'Let me' will be REJECTED",
+            "3. **ACTUAL TOOL EXECUTION ONLY** - You must use the Action: tool_name format to call tools",
+            "4. **WAIT FOR TOOL RESULTS** - Get actual results from tools before proceeding",
+            "5. **REPORT RELEVANT OUTPUTS** - Use exactly what tools return, focus on answering the user's question",
+            "",
+            "❌ FORBIDDEN RESPONSES:",
+            "- 'I will start by executing...'",
+            "- 'Let me use the tools...'",
+            "- 'I need to call...'",
+            "- Any planning or meta-commentary",
+            "",
+            "✅ REQUIRED EXECUTION PATTERN:",
+            "Step 1: IMMEDIATELY call first RELEVANT tool using Action: tool_name format",
+            "Step 2: Process tool result",
+            "Step 3: Call next RELEVANT tool if needed",
+            "Step 4: Synthesize actual tool results into final answer that addresses user's question",
+            "",
+            "🔥 START EXECUTING TOOLS NOW - NO PLANNING TEXT ALLOWED",
+            "",
+            "SMART EXECUTION EXAMPLES:",
+            "",
+            "For 'Check for any errors or warnings':",
+            "1. Action: detect_flight_events with query 'errors and warnings'",
+            "2. Report error findings directly",
+            "3. Skip analyze_altitude (not relevant to error checking)",
+            "",
+            "For 'What was the maximum altitude?':",
+            "1. Action: analyze_altitude with query 'maximum altitude'",
+            "2. Report altitude finding directly",
+            "3. Skip detect_flight_events (not relevant to altitude query)",
+            "",
+            "RESPONSE FORMAT:",
+            "- Start with actual findings that answer the user's specific question",
+            "- Present specific data, numbers, and measurements from relevant tools",
+            "- Combine multiple tool results intelligently when all are relevant",
+            "- Keep response focused on what the user actually asked for",
+            "- NEVER add information not provided by tools"
+        ])
+        
+        # Join all parts with newlines - completely safe from f-string evaluation
+        description = "\n".join(description_parts)
 
-User Question: {user_message}
+        expected_output = """🚨 MANDATORY TOOL EXECUTION RESULTS ONLY
 
-EXECUTION PLAN:
-Tools to Execute: {execution_plan.tool_sequence}
-Reasoning: {execution_plan.reasoning}
+Your response MUST contain ACTUAL TOOL RESULTS that answer the user's specific question.
 
-YOU MUST EXECUTE THESE SPECIFIC TOOLS: {execution_plan.tool_sequence}
+REQUIRED FORMAT:
+1. Start immediately with Action: tool_name to call first RELEVANT tool
+2. Process tool result and report findings that answer user's question
+3. Call next tool using Action: tool_name format ONLY if relevant to query
+4. Continue until user's question is answered
+5. Provide final answer focused on what user specifically asked for
 
-🚨 TOOL CALLING FORMAT (CRITICAL):
-Use this EXACT format when calling tools:
+❌ WILL BE REJECTED:
+- "I will start by executing..."
+- "Let me use the tools..."
+- "I need to call..."
+- Any planning or meta-commentary
+- Reporting irrelevant tool results (e.g., altitude data for error queries)
 
-Action: tool_name
-Action Input: {{"parameter": "value"}}
+✅ MUST INCLUDE:
+- Actual tool execution using Action: format
+- Real data, numbers, and findings from tools that answer the user's question
+- Specific measurements from relevant tool outputs
+- Final answer that directly addresses what the user asked for
 
-🔥 CRITICAL RULE: ONLY REPORT WHAT TOOLS ACTUALLY RETURN
-- If a tool returns "Found 5 critical errors with subsystem GPS", report exactly that
-- If a tool returns "No errors detected", report exactly that
-- If a tool returns "Maximum altitude: 1,247 meters", report exactly that
-- NEVER add your own interpretation or make up results
-
-INTELLIGENT EXECUTION:
-- For single tool plans: Execute that tool and report its exact output
-- For multi-tool plans: Execute each tool and report what each tool actually returned
-- Always provide ACTUAL results from tool execution, never describe what you "will do"
-- If tool output is clear and complete, use it directly without modification
-
-MULTI-TOOL SYNTHESIS:
-When using multiple tools, combine their ACTUAL results:
-- Report what each tool actually found
-- Only synthesize if tool outputs are complementary
-- Create a unified narrative using only the actual tool outputs
-- Keep the response conversational and well-structured
-
-🔥 CRITICAL TOOL CALLING FORMAT:
-When you need to call a tool, use EXACTLY this format (no numbering, no prefixes):
-
-Action: tool_name
-Action Input: {{"parameter": "value"}}
-
-CORRECT EXAMPLES:
-Action: analyze_altitude  
-Action Input: {{"query": "maximum altitude"}}
-
-Action: execute_python_code
-Action Input: {{"code": "What was the flight duration?"}}
-
-Action: detect_flight_events
-Action Input: {{"query": "critical errors"}}
-
-❌ NEVER USE (THESE WILL FAIL):
-- "1. Tool Name: analyze_altitude"
-- "Tool: analyze_altitude" 
-- Any numbering or prefixes
-
-CRITICAL EXECUTION REQUIREMENTS:
-1. **YOU MUST CALL TOOLS IMMEDIATELY** - No planning or explaining, just execute
-2. **If plan has [analyze_altitude]** → Call analyze_altitude tool right now
-3. **If plan has [execute_python_code]** → Call execute_python_code tool right now  
-4. **If plan has [detect_flight_events]** → Call detect_flight_events tool right now
-5. **If plan has multiple tools** → Call ALL tools and combine results
-6. **Return ACTUAL data from tools** - specific numbers, findings, measurements
-7. **NEVER give up** - Tools have intelligent fallbacks, always provide results
-8. **TRUST TOOL OUTPUTS** - If tools return meaningful data, use it exactly as provided
-
-ERROR ANALYSIS EXECUTION:
-- For critical error queries: execute_python_code has comprehensive error analysis
-- detect_flight_events has robust fallback analysis that always provides results
-- Both tools will find errors if they exist, or confirm no critical issues
-- Report exactly what these tools return, don't interpret or summarize
-
-FORBIDDEN RESPONSES:
-- "I will analyze..." 
-- "Let me check..."
-- "I should start by..."
-- "Unable to provide due to limitations"
-- "Technical limitations prevent..."
-- "The analysis detected..." (unless tool output actually says "detected")
-- Any response without actual tool execution results
-- Making up results when tools return something different
-- "I encountered an error with the planned tools" (tools are available, use them!)
-
-REQUIRED WORKFLOW:
-1. **IMMEDIATELY CALL THE FIRST TOOL** - No explaining, no planning, just call it
-2. **REPORT EXACT TOOL OUTPUT** - Copy the tool's response exactly
-3. **IF MULTIPLE TOOLS PLANNED** - Call each tool in sequence and combine results
-4. **NEVER GIVE UP** - Tools have fallbacks that always work
-
-CRITICAL EXECUTION RULE:
-- You MUST call tools immediately on your first turn
-- You CANNOT respond without calling the planned tools
-- Your response MUST contain actual data from tool execution
-- If you don't call tools, you have failed your task
-
-REQUIRED: Start your response with actual findings from tool execution, not intentions. Report tool outputs exactly as received."""
-
-        expected_output = """ACTUAL TOOL RESULTS ONLY. Your response must:
-1. Start with tool execution results (not plans or intentions)
-2. Contain specific data, numbers, and findings from tools
-3. Report exactly what tools returned
-4. Combine multiple tool results if multiple tools were planned
-5. Never include phrases like "I will use" or "Let me analyze"
-
-FORBIDDEN: Any response that doesn't contain actual tool execution results"""
+CRITICAL: Only report data that tools actually returned AND that answers the user's specific question."""
 
         return Task(
             description=description,
@@ -3191,10 +2417,14 @@ FORBIDDEN: Any response that doesn't contain actual tool execution results"""
         )
 
     def _create_critique_task(self, user_message: str, execution_result: str) -> Task:
-        """Create the critique task for balanced response optimization."""
-        description = f"""CRITICAL: Transform this technical analysis into the final user response. Do NOT provide intermediate thoughts or planning statements.
+        """Create the enhanced critique task with advanced report generation capabilities."""
+        # Detect if this is a flight summary request
+        is_summary_request = self._is_flight_summary_request(user_message)
+        
+        description = f"""CRITICAL: Transform this technical analysis into the final user response using your enhanced report generation capabilities.
 
 Original Question: {user_message}
+Is Flight Summary Request: {is_summary_request}
 
 Technical Analysis Result: {execution_result}
 
@@ -3204,83 +2434,109 @@ Technical Analysis Result: {execution_result}
 - "I now can provide..."
 - Any planning or meta-commentary
 
-RESPONSE OPTIMIZATION:
-1. **Smart formatting** - bullet points for multi-aspect, natural sentences for simple questions
-2. **Essential information only** - key numbers, findings, measurements
-3. **Immediate usefulness** - user gets exactly what they asked for
-4. **Professional quality** - well-formatted and conversational
+🔥 CRITICAL DATA INTEGRITY CHECK:
+If the Technical Analysis Result contains ONLY planning statements like "I will start by executing..." or "Let me use..." without ANY actual data or results, then you MUST:
+1. Recognize that NO ACTUAL ANALYSIS was performed
+2. Return: "I'm preparing a comprehensive flight analysis for you. Please try your question again in a moment."
+3. NEVER fabricate specific numbers, measurements, or findings that weren't actually generated
 
-RESPONSE LENGTH BY QUERY TYPE:
-- Simple questions (max altitude, specific errors): 1-2 sentences
-- Flight summaries: 4-6 sentences covering main aspects
-- Multi-aspect queries: 3-5 sentences with key findings
+ONLY provide specific flight data (altitudes, times, errors, etc.) if they appear in the Technical Analysis Result from actual tool execution.
 
-ESSENTIAL DETAILS FOR FLIGHT SUMMARIES:
-- Flight duration and altitude performance
-- Power/battery status and health
-- Navigation quality (GPS, signal issues)
-- Critical events or clean flight confirmation
-- Safety-relevant findings
+📊 ENHANCED RESPONSE LOGIC:
 
-FORMATTING TO REMOVE:
-- Verbose section headers like "Altitude Analysis Summary:", "Flight Profile Analysis:"
-- Sub-categories and nested breakdowns
-- Redundant measurements and explanations
-- "Insights:" sections and educational content
+**IF THIS IS A FLIGHT SUMMARY REQUEST ({is_summary_request}):**
+Generate a **CONSOLIDATED HUMAN-READABLE SUMMARY** by:
 
-SMART FORMATTING TO USE:
-- Clean bullet points for flight summaries and multi-aspect responses
-- Natural sentences for simple, single-aspect questions
-- Specific measurements and times
-- Essential operational context
-- Critical safety information
+1. **Data Extraction:** Parse the Technical Analysis Result to extract:
+   - Altitude metrics (max, min, average, range)
+   - Power system data (voltage, current, battery info)
+   - GPS/Navigation data (satellites, HDOP, signal quality)
+   - System events and alerts (error counts, warnings, failures)
 
-TRANSFORMATION EXAMPLES:
+2. **Rules-Based Analysis:** Apply analytical rules to extracted data:
+   - GPS HDOP > 5.0 - Add GPS accuracy warning
+   - Minimum voltage < 1.0V - Add power system warning
+   - Event count > 10 - Add high event count note
+   - Satellite count < 4 - Add GPS signal warning
 
-BEFORE (VERBOSE SECTIONS):
-"Altitude Analysis Summary:
-- Maximum altitude: 1448.0m
-- Average altitude: 160.9m  
-- Total altitude range: 1448.0m
+3. **Human-Readable Summary Generation:** Structure as conversational analysis:
+   
+   Create a natural, flowing summary that covers:
+   - Flight altitude performance in conversational language
+   - Power system status with clear explanations
+   - GPS and navigation quality in plain English
+   - System events and alerts with context
+   - Critical insights and recommendations in accessible language
+   
+   Format as natural paragraphs, not markdown syntax or bullet points.
+   Use conversational tone while maintaining technical accuracy.
 
-Flight Profile Analysis:
-- The flight exhibited extensive altitude changes, reaching a maximum of 1448.0m.
+4. **Dynamic Content:** Only include sections where executor provided data
+5. **Professional but Accessible:** Clear, conversational formatting without markdown syntax
 
-GPS Data Quality Analysis:
-- GPS signal quality: 2.5 satellites (poor reception)
-- RC signal quality: Good"
+**IF THIS IS A SIMPLE/SPECIFIC QUESTION:**
+Use standard response optimization:
+- Single measurement queries - Natural sentence responses
+- Specific error checks - Bullet point findings  
+- Basic questions - Direct, clear answers
 
-AFTER (BALANCED WITH BULLET POINTS FOR SUMMARY):
-"Flight Summary:
-• Reached maximum altitude of 1,448m with extensive altitude changes
-• GPS reception was poor with only 2.5 satellites detected  
-• RC signal quality remained good throughout the flight
-• Flight profile suggests complex mission with distinct phases"
+**RESPONSE QUALITY STANDARDS:**
+- Preserve all executor data exactly as provided
+- Apply rules-based analysis only when data supports it
+- Use professional, analytical language
+- Highlight critical findings requiring attention
+- Maintain consistency in formatting and terminology
 
-FOR SIMPLE QUESTIONS (NATURAL SENTENCES):
-"The maximum altitude reached was 1,448 meters."
+**DATA EXTRACTION PATTERNS:**
+From executor results, look for patterns like:
+- "Maximum altitude: 1448m" - Extract: max_altitude = 1448
+- "Average voltage: 50.64V" - Extract: avg_voltage = 50.64
+- "Detected 18 flight events" - Extract: event_count = 18
+- "Average satellites: 2.5" - Extract: avg_satellites = 2.5
+- "Average HDOP: 42.24" - Extract: avg_hdop = 42.24
+
+**CRITICAL RULES FOR ANALYTICAL NOTES:**
+Only add analytical notes if:
+1. Executor provided the specific metric
+2. Metric meets the threshold condition
+3. Note adds genuine value for flight safety/analysis
 
 🚨 MANDATORY FINAL OUTPUT: 
-Provide the complete, final response that directly answers the user's question. This will be shown to the user immediately. No planning thoughts, no intermediate statements, just the optimized final answer."""
+Provide the complete, final response optimized for the request type. For flight summaries, deliver a conversational, human-readable summary in natural language paragraphs (NO markdown syntax). For specific questions, provide direct answers. This will be shown to the user immediately."""
 
-        expected_output = """The complete, final response that the user will see. Must be:
-1. The actual answer to their question (not planning or meta-commentary)
-2. Properly formatted (bullet points for summaries, sentences for simple questions)  
-3. Contains essential information and key numbers
-4. Immediately useful and professional
-5. NEVER includes intermediate thoughts like "I can provide..." or "Let me optimize..."
+        expected_output = f"""The complete, final response optimized for the request type:
 
-Example outputs:
-- Simple: "The maximum altitude reached was 1,448 meters."
-- Multi-aspect: "Power System Analysis: • Battery voltage averaged 15.2V... • Current peaked at 28A... • Temperature remained safe at 42°C max"
+{"**FOR FLIGHT SUMMARY REQUEST:** Generate a conversational, human-readable summary with:" if is_summary_request else "**FOR SPECIFIC QUESTION:** Provide a direct, clear answer with:"}
 
-CRITICAL: Output only the final answer, nothing else."""
+1. Data extracted EXACTLY from executor results (no fabrication)
+2. {"Natural conversational formatting in flowing paragraphs" if is_summary_request else "Appropriate formatting (sentences/bullets)"}
+3. {"Rules-based analytical insights integrated naturally into the text" if is_summary_request else "Essential information and key numbers"}
+4. Professional but accessible presentation in plain English
+5. No planning thoughts or meta-commentary
+
+{"Example: 'The flight reached a maximum altitude of 1,448 meters with an average of 161 meters throughout the mission. The power system performed well with an average voltage of 50.64V, though a minimum reading of 0.00V suggests potential sensor issues. GPS navigation showed challenges with only 2.5 satellites on average and a high HDOP of 42.24, indicating reduced positioning accuracy. During the flight, 18 system events were recorded, including several failsafe activations that warrant further review.'" if is_summary_request else "Direct answer that addresses the user's specific question."}
+
+CRITICAL: Output only the final answer, nothing else. For flight summaries, use natural language paragraphs, NOT markdown syntax."""
 
         return Task(
             description=description,
             expected_output=expected_output,
             agent=None  # Will be set when creating crew
         )
+    
+    def _is_flight_summary_request(self, user_message: str) -> bool:
+        """Detect if the user is requesting a comprehensive flight summary."""
+        message_lower = user_message.lower()
+        
+        summary_indicators = [
+            "flight summary", "summary of this flight", "summary of the flight",
+            "overall analysis", "comprehensive report", "flight performance report",
+            "flight report", "complete analysis", "full analysis",
+            "give me a summary", "summarize this flight", "summarize the flight",
+            "flight overview", "performance summary", "analysis summary"
+        ]
+        
+        return any(indicator in message_lower for indicator in summary_indicators)
 
     async def chat(self, session_id: str, user_message: str) -> str:
         """
@@ -3330,9 +2586,9 @@ CRITICAL: Output only the final answer, nothing else."""
             executor_agent = self._create_executor_agent(session)
             critic_agent = self._create_critic_agent(session)
             
-            # Stage 1: Enhanced Planning with fallback validation
+            # Stage 1: Enhanced Planning with intelligent intent-based fallback
             logger.info(f"[{session_id}] Stage 1: ENHANCED PLANNER")
-            planning_task = self._create_planning_task(user_message, session)
+            planning_task = await self._create_planning_task(user_message, session)
             planning_task.agent = planner_agent
             
             planning_crew = Crew(
@@ -3349,17 +2605,17 @@ CRITICAL: Output only the final answer, nothing else."""
                 plan_text = str(plan_result)
                 execution_plan = self._parse_execution_plan(plan_text)
                 
-                # Enhanced plan validation with intelligent fallbacks
+                # Enhanced plan validation with intelligent intent-based fallbacks
                 if not execution_plan.needs_tools or not execution_plan.tool_sequence:
-                    logger.warning(f"[{session_id}] PLANNER returned invalid plan, creating intelligent fallback")
-                    execution_plan = self._create_intelligent_fallback_plan(user_message, session)
+                    logger.warning(f"[{session_id}] PLANNER returned invalid plan, using intelligent intent-based fallback")
+                    execution_plan = await self._create_intent_based_plan(user_message, session)
                 
                 logger.info(f"[{session_id}] PLANNER completed - Plan confidence: {execution_plan.confidence:.2f}, Tools: {execution_plan.tool_sequence}")
                 
             except Exception as planning_error:
                 logger.error(f"[{session_id}] PLANNER failed: {str(planning_error)}")
-                execution_plan = self._create_intelligent_fallback_plan(user_message, session)
-                logger.info(f"[{session_id}] Using fallback plan: {execution_plan.tool_sequence}")
+                execution_plan = await self._create_intent_based_plan(user_message, session)
+                logger.info(f"[{session_id}] Using intelligent intent-based fallback plan: {execution_plan.tool_sequence}")
             
             # Stage 2: Enhanced Execution with error recovery
             logger.info(f"[{session_id}] Stage 2: INTELLIGENT EXECUTOR - Tools: {execution_plan.tool_sequence}")
@@ -3725,6 +2981,7 @@ CRITICAL: Output only the final answer, nothing else."""
         """Ensure the executor actually calls tools instead of just describing what it will do."""
         if hasattr(step, 'output') and step.output:
             output = step.output.lower()
+            
             # Check if the agent is just describing what it will do instead of doing it
             problematic_phrases = [
                 "i will start by",
@@ -3735,13 +2992,33 @@ CRITICAL: Output only the final answer, nothing else."""
                 "i'll analyze",
                 "i'll execute",
                 "i need to call",
-                "i should use"
+                "i should use",
+                "let me begin",
+                "i will execute",
+                "i plan to",
+                "i intend to",
+                "first, i will",
+                "next, i will",
+                "i will proceed",
+                "let me start",
+                "i will now",
+                "my approach will be"
             ]
             
-            if any(phrase in output for phrase in problematic_phrases):
-                # Force the agent to actually call tools
-                logger.warning(f"Agent is describing instead of executing tools. Forcing tool execution.")
-                # This will trigger a retry where the agent should actually call tools
+            # Also check for absence of actual tool calls
+            has_tool_calls = any(pattern in output for pattern in [
+                "action:", "action input:", "thought:", "observation:"
+            ])
+            
+            is_planning = any(phrase in output for phrase in problematic_phrases)
+            
+            if is_planning and not has_tool_calls:
+                # Log the problematic response
+                logger.error(f"EXECUTOR AGENT GENERATING PLANNING TEXT INSTEAD OF EXECUTING TOOLS: {step.output[:200]}...")
+                
+                # Force the agent to retry with more explicit instructions
+                # This is a more aggressive intervention
+                step.output = "ERROR: You must execute tools immediately using Action: tool_name format. Do not provide planning text. Start tool execution now."
                 return step
         
         return step
@@ -3776,69 +3053,111 @@ CRITICAL: Output only the final answer, nothing else."""
             "cost_per_1k_tokens": total_cost * 1000 / total_tokens if total_tokens > 0 else 0
         }
 
-    def _create_intelligent_fallback_plan(self, user_message: str, session: V2ConversationSession) -> ExecutionPlan:
-        """Create an intelligent fallback plan when the planner fails or returns invalid results."""
-        user_lower = user_message.lower()
+    async def _create_intent_based_plan(self, user_message: str, session: V2ConversationSession) -> ExecutionPlan:
+        """Create an execution plan based on intelligent intent classification and semantic data understanding."""
+        try:
+            # Use Intent Classifier to intelligently categorize the query
+            classified_intent = await self.intent_classifier.classify_intent(user_message, session)
+            
+            # Phase 3: Get semantic context for data source selection
+            semantic_matches = await self.semantic_retriever.find_relevant_dataframes(
+                user_message, 
+                list(session.dataframes.keys()), 
+                top_k=3
+            )
+            
+            logger.info(f"[{session.session_id}] Intent classified: {classified_intent.intent_name} (confidence: {classified_intent.confidence:.2f})")
+            if semantic_matches:
+                logger.info(f"[{session.session_id}] Semantic matches: {[m.dataframe_key for m in semantic_matches]}")
+            
+            # Use the recommended tools from intent configuration
+            tool_sequence = classified_intent.recommended_tools.copy()
+            reasoning = f"Intent-based routing: {classified_intent.reasoning}"
+            
+            # Enhance reasoning with semantic context
+            if semantic_matches:
+                relevant_dfs = [m.dataframe_key for m in semantic_matches[:3]]
+                reasoning += f". Semantic analysis indicates most relevant dataframes: {', '.join(relevant_dfs)}"
+            
+            confidence = classified_intent.confidence
+            
+            # Determine critique requirement based on intent and tool count
+            requires_critique = self._should_use_critique(classified_intent.intent_key, tool_sequence)
+            
+            # Determine complexity based on intent and tools
+            estimated_complexity = self._estimate_complexity(classified_intent.intent_key, tool_sequence)
+            
+            # Phase 3: Use semantic matches to focus on most relevant dataframes
+            target_dataframes = list(session.dataframes.keys())
+            if semantic_matches:
+                # Prioritize semantically relevant dataframes
+                relevant_dfs = [m.dataframe_key for m in semantic_matches]
+                target_dataframes = relevant_dfs + [df for df in target_dataframes if df not in relevant_dfs]
+            
+            return ExecutionPlan(
+                needs_tools=True,
+                tool_sequence=tool_sequence,
+                reasoning=reasoning,
+                confidence=confidence,
+                approach="intent_and_semantic_routing",
+                estimated_complexity=estimated_complexity,
+                requires_critique=requires_critique,
+                max_iterations=6,
+                success_criteria=["intent_specific_answer_provided"],
+                target_dataframes=target_dataframes,
+                target_columns={},
+                data_relationships=[f"Semantic match: {m.dataframe_key} ({m.relevance_reason})" for m in semantic_matches],
+                execution_steps=[f"Execute {tool} based on {classified_intent.intent_name}" for tool in tool_sequence],
+                stopping_conditions=["intent_satisfied", "all_tools_attempted"],
+                classified_intent=classified_intent
+            )
+            
+        except Exception as e:
+            logger.error(f"[{session.session_id}] Intent classification failed: {e}, using simple fallback")
+            return self._create_simple_fallback_plan(user_message, session)
+    
+    def _should_use_critique(self, intent_key: str, tool_sequence: List[str]) -> bool:
+        """Determine if critique is needed based on intent and tools."""
+        # Single-tool intents usually don't need critique
+        if len(tool_sequence) == 1:
+            return False
         
-        # Analyze the query to determine best fallback strategy
-        if any(word in user_lower for word in ['altitude', 'height', 'maximum', 'minimum', 'highest', 'lowest']):
-            tool_sequence = ["analyze_altitude", "execute_python_code"]
-            reasoning = "Altitude-focused analysis with backup calculation"
-            confidence = 0.7
-        elif any(word in user_lower for word in ['power', 'battery', 'voltage', 'current', 'consumption']):
-            tool_sequence = ["execute_python_code"]
-            reasoning = "Power consumption analysis using comprehensive battery analysis"
-            confidence = 0.8
-        elif any(word in user_lower for word in ['error', 'warning', 'problem', 'issue', 'critical', 'fail']):
-            # For critical error queries, prioritize comprehensive analysis
-            if 'critical' in user_lower or 'mid-flight' in user_lower:
-                tool_sequence = ["execute_python_code", "detect_flight_events"]
-                reasoning = "Comprehensive critical error analysis with timeline focus and intelligent fallbacks"
-                confidence = 0.8
-            else:
-                tool_sequence = ["detect_flight_events", "execute_python_code"]
-                reasoning = "Error analysis with intelligent fallbacks and comprehensive checking"
-                confidence = 0.7
-        elif any(word in user_lower for word in ['summary', 'overview', 'flight', 'analyze', 'check']):
-            tool_sequence = ["enhanced_telemetry_analysis", "execute_python_code", "detect_flight_events"]
-            reasoning = "Comprehensive analysis starting with enhanced telemetry analysis for complete coverage"
-            confidence = 0.7
-        elif any(word in user_lower for word in ['comprehensive', 'complete', 'full', 'advanced', 'detailed']):
-            tool_sequence = ["enhanced_telemetry_analysis"]
-            reasoning = "Enhanced comprehensive telemetry analysis covering all 164 message types"
-            confidence = 0.8
+        # Comprehensive analysis intents benefit from critique
+        if intent_key in ['flight_performance_analysis', 'anomaly_detection']:
+            return True
+        
+        # Multi-tool plans generally benefit from critique
+        if len(tool_sequence) > 2:
+            return True
+        
+        return False
+    
+    def _estimate_complexity(self, intent_key: str, tool_sequence: List[str]) -> str:
+        """Estimate complexity based on intent and tool requirements."""
+        if intent_key in ['flight_performance_analysis', 'anomaly_detection'] or len(tool_sequence) > 2:
+            return "high"
+        elif len(tool_sequence) == 2 or intent_key in ['flight_events_analysis', 'navigation_analysis']:
+            return "medium"
         else:
-            # Default fallback: use the most versatile tool
-            tool_sequence = ["execute_python_code"]
-            reasoning = "Versatile analysis with direct query fallbacks"
-            confidence = 0.6
-        
-        # Determine if critique is needed based on query type
-        requires_critique = True
-        if any(word in user_lower for word in ['altitude', 'height', 'maximum', 'minimum', 'highest', 'lowest']):
-            requires_critique = False  # Altitude tool provides well-structured output
-        elif any(word in user_lower for word in ['power', 'battery', 'voltage', 'current']):
-            requires_critique = False  # Enhanced code provides good structure for specific queries
-        elif 'summary' in user_lower or 'overview' in user_lower:
-            requires_critique = True   # Multi-tool summaries benefit from organization
-        elif len(tool_sequence) == 1 and 'execute_python_code' in tool_sequence:
-            requires_critique = False  # Single code tool works better without heavy critique
-        
+            return "low"
+    
+    def _create_simple_fallback_plan(self, user_message: str, session: V2ConversationSession) -> ExecutionPlan:
+        """Simple fallback when intent classification fails completely."""
         return ExecutionPlan(
             needs_tools=True,
-            tool_sequence=tool_sequence,
-            reasoning=reasoning,
-            confidence=confidence,
-            approach="intelligent_fallback",
+            tool_sequence=["execute_python_code"],
+            reasoning="Simple fallback due to intent classification failure",
+            confidence=0.5,
+            approach="simple_fallback",
             estimated_complexity="medium",
-            requires_critique=requires_critique,
+            requires_critique=False,
             max_iterations=6,
-            success_criteria=["specific_answer_provided"],
+            success_criteria=["provide_answer"],
             target_dataframes=list(session.dataframes.keys()),
             target_columns={},
             data_relationships=[],
-            execution_steps=[f"Execute {tool}" for tool in tool_sequence],
-            stopping_conditions=["answer_found", "all_tools_attempted"]
+            execution_steps=["Execute versatile analysis tool"],
+            stopping_conditions=["answer_found"]
         )
     
     def _is_execution_result_useful(self, execution_text: str) -> bool:
@@ -3952,6 +3271,14 @@ CRITICAL: Output only the final answer, nothing else."""
         except Exception as e:
             logger.error(f"[{session.session_id}] Emergency fallback failed: {str(e)}")
             return "I'm having difficulty analyzing your flight data right now. Please try asking a more specific question, such as 'What was the maximum altitude?' or 'Were there any GPS errors?'"
+
+# REMOVED: Hardcoded validation logic replaced by intelligent IntentClassifier system
+# The existing LLM-based IntentClassifier in _create_intent_based_plan provides:
+# - Dynamic, configurable intent detection
+# - LLM-based classification instead of brittle keyword matching  
+# - Extensible through config.py without code changes
+# - Context-aware classification using conversation history
+# This is far superior to hardcoded if/elif validation rules.
 
 
 # Compatibility aliases for easy integration

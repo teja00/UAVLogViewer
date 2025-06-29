@@ -12,4 +12,8 @@ requests==2.31.0
 httpx==0.25.2
 beautifulsoup4==4.12.2
 lxml==4.9.3
-pymavlink==2.4.37 
+pymavlink==2.4.37
+chromadb==1.0.13
+sentence-transformers==4.1.0
+transformers==4.53.0
+crewai==0.134.0 
